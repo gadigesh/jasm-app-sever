@@ -1,28 +1,19 @@
 const express = require("express");
-require("dotenv").config();
-const app = express();
 const connectDB = require("./config/database");
-const User = require("./models/user");
+const cookiePaser = require("cookie-parser");
+const cors = require("cors");
+const app = express();
 
 app.use(express.json());
-
-app.post("/signup", async (req, res) => {
-	try {
-		console.log(req.body);
-		// const user = new User({
-		// 	name: "Gadigesh",
-		// 	email: "gadigesh@gmail.com",
-		// 	password: "123456",
-		// });
-		await user.save();
-		res.status(201).json({
-			message: "User created successfully",
-			Data: user,
-		});
-	} catch (error) {
-		res.status(500).json({ error: error.message });
-	}
-});
+app.use(cookiePaser());
+app.use(
+	cors({
+		origin: "http://localhost:5174",
+		credentials: true,
+	})
+);
+const authRouter = require("./routes/auth");
+app.use("/", authRouter);
 
 connectDB()
 	.then(() => {
@@ -34,4 +25,3 @@ connectDB()
 		console.error("Failed to connect to MongoDB:", error);
 		process.exit(1);
 	});
-	
