@@ -1,9 +1,9 @@
-Create a repository for the JASM App Server
-intialize the repository
-node modules,pakage.json,package-lock.json
-install express
-create a server
-listen to port 3333
-install nodemon
-update scripts in package.json
-what is the difference between caret and tilde in package.json
+- Create a repository for the JASM App Server
+- intialize the repository
+- node modules,pakage.json,package-lock.json
+- install express
+- create a server
+- listen to port 3333
+- install nodemon
+- update scripts in package.json
+- what is the difference between caret and tilde in package.json
