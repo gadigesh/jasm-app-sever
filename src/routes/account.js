@@ -63,6 +63,15 @@ accountRouter.post("/accounts/create", userAuth, async (req, res) => {
 	}
 });
 
+accountRouter.post("/switch-account", userAuth, async (req, res) => {
+	const { accountId } = req.body;
+
+	req.user.activeAccountId = accountId;
+	await req.user.save();
+
+	res.json({ message: "Active account updated" });
+});
+
 accountRouter.get("/accounts", userAuth, async (req, res) => {
 	try {
 		const { status } = req.query;

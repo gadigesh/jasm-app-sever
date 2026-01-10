@@ -25,11 +25,6 @@ const accountSchema = new mongoose.Schema(
 	}
 );
 
-/**
- * Frontend-friendly transform
- * _id → id
- * updatedAt → lastUpdated
- */
 
 accountSchema.set("toJSON", {
 	transform: (doc, ret) => {

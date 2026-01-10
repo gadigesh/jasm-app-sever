@@ -2,12 +2,27 @@ const express = require("express");
 const authRouter = express.Router();
 const User = require("../models/user");
 const { validateSignUpdata } = require("../utils/validation");
+const Account = require("../models/account");
 const bcrypt = require("bcrypt");
 const { userAuth } = require("../middlewares/auth");
 
 authRouter.get("/me", userAuth, async (req, res) => {
 	try {
-		res.send(req.user);
+		let activeAccount = null;
+
+		if (req.user.activeAccountId) {
+			activeAccount = await Account.findById(
+				req.user.activeAccountId
+			).lean();
+		}
+
+		res.json({
+			_id: req.user._id,
+			firstName: req.user.firstName,
+			emailId: req.user.emailId,
+			photoUrl: req.user.photoUrl,
+			activeAccount,
+		});
 	} catch (error) {
 		res.status(401).send(error.message + " please login");
 	}
@@ -15,28 +30,47 @@ authRouter.get("/me", userAuth, async (req, res) => {
 authRouter.post("/signup", async (req, res) => {
 	try {
 		validateSignUpdata(req);
+
 		const { firstName, lastName, emailId, password, photoUrl } = req.body;
 		const passwordHash = await bcrypt.hash(password, 10);
+
+		// 1️⃣ Find or create default account FIRST
+		let account = await Account.findOne({
+			clientName: "Jivox",
+			accountName: "Demo",
+		});
+
+		if (!account) {
+			account = await Account.create({
+				clientName: "Jivox",
+				accountName: "Demo",
+				accountStatus: "Active",
+			});
+		}
+
+		// 2️⃣ Create user WITH correct activeAccountId
 		const user = new User({
 			firstName,
 			lastName,
 			emailId,
 			password: passwordHash,
 			photoUrl,
+			activeAccountId: account._id, // ✅ CORRECT
 		});
 
 		const saveUser = await user.save();
 		const token = await saveUser.getJWT();
 
+		// ⚠️ LOCALHOST COOKIE SETTINGS
 		res.cookie("token", token, {
-			httpOnly: true, // prevents JS from accessing cookie
-			secure: true, // required over HTTPS
-			sameSite: "none", // allows cross-site cookies (Firebase frontend)
-			maxAge: 24 * 60 * 60 * 1000, // 1 day
+			httpOnly: true,
+			secure: false, // 🔥 MUST be false on localhost
+			sameSite: "lax", // 🔥
+			maxAge: 24 * 60 * 60 * 1000,
 		});
+
 		res.json({
 			message: "User added successfully",
-			data: saveUser,
 		});
 	} catch (err) {
 		res.status(401).json({ message: err.message });
@@ -59,7 +93,7 @@ authRouter.post("/login", async (req, res) => {
 			res.cookie("token", token, {
 				httpOnly: true, // prevents JS from accessing cookie
 				secure: true, // required over HTTPS
-				sameSite: "none", // allows cross-site cookies (Firebase frontend)
+				sameSite: "lax", // allows cross-site cookies (Firebase frontend)
 				maxAge: 24 * 60 * 60 * 1000, // 1 day
 			});
 			res.send(user);

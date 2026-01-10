@@ -25,9 +25,11 @@ app.use(
 
 const authRouter = require("./routes/auth");
 const accountRouter = require("./routes/account");
+const assetRouter = require("./routes/assetTemplate");
 
 app.use("/", authRouter);
 app.use("/", accountRouter);
+app.use("/", assetRouter);
 
 connectDB()
 	.then(() => {
