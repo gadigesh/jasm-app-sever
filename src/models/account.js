@@ -19,12 +19,15 @@ const accountSchema = new mongoose.Schema(
 			enum: ["Active", "Inactive"],
 			default: "Active",
 		},
+		accountAdvId: {
+			type: Number,
+			trim: true,
+		},
 	},
 	{
 		timestamps: true, // gives createdAt & updatedAt
 	}
 );
-
 
 accountSchema.set("toJSON", {
 	transform: (doc, ret) => {

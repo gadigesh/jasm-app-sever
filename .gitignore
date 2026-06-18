@@ -1,2 +1,5 @@
 node_modules
-.envgoogle-credentials.json
+uploads/
+temp_uploads/
+.DS_Store
+verify_syntax_2.js

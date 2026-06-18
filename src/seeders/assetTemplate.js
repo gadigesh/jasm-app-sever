@@ -4,7 +4,7 @@ const { ASSET_TEMPLATE_IDS } = require("../constants/assetTemplate");
 const seedAssetTemplates = async () => {
 	const templates = [
 		{
-			id: "prospecting",
+			id: "RMA",
 			title: "Prospecting",
 			desc: "Standard row-column structure optimized for Google Sheets and Excel exports.",
 			icon: "FileSpreadsheet",

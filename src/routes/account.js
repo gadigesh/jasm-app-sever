@@ -7,7 +7,8 @@ const normalize = (value) => value.trim().toLowerCase();
 
 accountRouter.post("/accounts/create", userAuth, async (req, res) => {
 	try {
-		const { accountName, clientName, accountStatus } = req.body;
+		const { accountName, clientName, accountStatus, accountAdvId } =
+			req.body;
 
 		if (!accountName || !clientName) {
 			return res.status(400).json({
@@ -35,6 +36,7 @@ accountRouter.post("/accounts/create", userAuth, async (req, res) => {
 			accountName: normalAccountName,
 			clientName: normalClientName,
 			accountStatus,
+			accountAdvId,
 		});
 
 		res.status(201).json({
