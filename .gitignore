@@ -3,3 +3,4 @@ uploads/
 temp_uploads/
 .DS_Store
 verify_syntax_2.js
+google-credentials.json

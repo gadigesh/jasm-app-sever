@@ -20,4 +20,3 @@ install postman app to test the api
 - .env file
 - connect to the database
 - create a user model
-# Copy google-credentials.json locally for GSheet support (not in repo due to GitHub secret scanning)
