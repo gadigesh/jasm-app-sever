@@ -6,6 +6,23 @@ const CopyMatrix = require("../../models/copyMatrix");
 const CopyMatrixRow = require("../../models/copyMatrixRow");
 const storageService = require("../storage");
 const { getExcelCellValue } = require("../processors/helper");
+const {
+	extractSheetId,
+	extractGid,
+	resolveSheetFromMeta,
+} = require("../../utils/gsheetHelpers");
+const {
+	AUTO_ROW_ID_COLUMN,
+	ensureRowIdColumn,
+	injectRowIdIntoRowData,
+} = require("../../constants/copyMatrix");
+const {
+	rowArrayFromRecord,
+	resolveHeadersFromGrid,
+	buildHeadersFromHeaderRow,
+	rowDataFromArray,
+	getWorksheetMaxColumn,
+} = require("../../utils/sheetColumnHelpers");
 
 const BATCH_SIZE = 500;
 const ROW_LIMIT = 40000;
@@ -16,21 +33,19 @@ const auth = new google.auth.GoogleAuth({
 	scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
 });
 
-function extractSheetId(ref) {
-	const match = ref.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-	return match ? match[1] : ref.trim();
-}
-
 async function saveRows(copyMatrixId, rows) {
 	await CopyMatrixRow.deleteMany({ copyMatrixId });
 
 	let inserted = 0;
 	for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-		const chunk = rows.slice(i, i + BATCH_SIZE).map((rowData, offset) => ({
-			copyMatrixId,
-			rowIndex: i + offset + 1,
-			rowData,
-		}));
+		const chunk = rows.slice(i, i + BATCH_SIZE).map((rowData, offset) => {
+			const rowIndex = i + offset + 1;
+			return {
+				copyMatrixId,
+				rowIndex,
+				rowData: injectRowIdIntoRowData(rowData, rowIndex),
+			};
+		});
 		await CopyMatrixRow.insertMany(chunk, { ordered: false });
 		inserted += chunk.length;
 	}
@@ -38,29 +53,21 @@ async function saveRows(copyMatrixId, rows) {
 }
 
 async function processCsv(matrixDoc) {
-	const rows = [];
-	const columns = new Set();
+	const rawRows = [];
 
 	await new Promise((resolve, reject) => {
 		storageService
 			.getReadStream(matrixDoc.fileRef)
-			.pipe(csv({ mapHeaders: ({ header }) => header.trim() }))
+			.pipe(csv({ headers: false }))
 			.on("data", (row) => {
-				const cleanRow = {};
-				for (const key in row) {
-					const value = row[key] ? String(row[key]).trim() : "";
-					cleanRow[key] = value;
-					if (key) columns.add(key);
-				}
-				if (Object.values(cleanRow).some(Boolean)) {
-					rows.push(cleanRow);
-				}
+				rawRows.push(rowArrayFromRecord(row));
 			})
 			.on("end", resolve)
 			.on("error", reject);
 	});
 
-	return { rows, columns: [...columns] };
+	const { headers, rows } = resolveHeadersFromGrid(rawRows);
+	return { rows, columns: headers };
 }
 
 async function processXlsx(matrixDoc) {
@@ -83,44 +90,53 @@ async function processXlsx(matrixDoc) {
 
 	let headers = [];
 	const rows = [];
+	const maxCol = getWorksheetMaxColumn(worksheet);
 
-	for (let i = 1; i <= worksheet.rowCount; i++) {
-		const row = worksheet.getRow(i);
-
-		if (i === 1) {
-			row.eachCell(
-				{ includeEmpty: true },
-				(cell, col) => {
-					headers[col] = getExcelCellValue(cell.value);
-				}
+	if (maxCol > 0) {
+		const headerCells = [];
+		for (let col = 1; col <= maxCol; col++) {
+			headerCells[col - 1] = getExcelCellValue(
+				worksheet.getRow(1).getCell(col).value
 			);
-			continue;
+		}
+		headers = buildHeadersFromHeaderRow(headerCells, maxCol);
+	}
+
+	for (let i = 2; i <= worksheet.rowCount; i++) {
+		const row = worksheet.getRow(i);
+		const rowArr = [];
+		for (let col = 1; col <= maxCol; col++) {
+			const value = getExcelCellValue(row.getCell(col).value);
+			rowArr[col - 1] = value ? String(value).trim() : "";
 		}
 
-		const rowData = {};
-		let hasValue = false;
-		headers.forEach((header, colIndex) => {
-			if (!header) return;
-			const cell = row.getCell(colIndex);
-			const value = getExcelCellValue(cell.value);
-			rowData[header] = value ? String(value).trim() : "";
-			if (rowData[header]) hasValue = true;
-		});
-
+		const { rowData, hasValue } = rowDataFromArray(rowArr, headers);
 		if (hasValue) rows.push(rowData);
 	}
 
-	return { rows, columns: headers.filter(Boolean) };
+	return { rows, columns: headers };
 }
 
 async function processGsheet(matrixDoc) {
 	const sheets = google.sheets({ version: "v4", auth });
 	const sheetId = extractSheetId(matrixDoc.fileRef);
+	const gid =
+		matrixDoc.sheetGid != null
+			? Number(matrixDoc.sheetGid)
+			: extractGid(matrixDoc.fileRef);
 
 	const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
-	const sheetInfo = meta.data.sheets[0];
+	const sheetInfo = resolveSheetFromMeta(meta.data.sheets, gid);
+	if (!sheetInfo) {
+		throw new Error("No sheets found in spreadsheet");
+	}
+
 	const title = sheetInfo.properties.title;
 	const totalRows = sheetInfo.properties.gridProperties.rowCount;
+
+	console.log(
+		`[CopyMatrix GSheet] tab="${title}" gid=${sheetInfo.properties.sheetId} rows=${totalRows}`
+	);
 
 	if (totalRows > ROW_LIMIT) {
 		throw new Error(
@@ -136,27 +152,22 @@ async function processGsheet(matrixDoc) {
 
 	const values = response.data.values || [];
 	if (values.length === 0) {
-		return { rows: [], columns: [] };
+		return {
+			rows: [],
+			columns: [],
+			sheetTitle: title,
+			sheetGid: sheetInfo.properties.sheetId,
+		};
 	}
 
-	const headers = values[0].map((h) => String(h || "").trim());
-	const rows = [];
+	const { headers, rows } = resolveHeadersFromGrid(values);
 
-	for (let i = 1; i < values.length; i++) {
-		const rowData = {};
-		let hasValue = false;
-		headers.forEach((header, colIndex) => {
-			if (!header) return;
-			const value = values[i][colIndex]
-				? String(values[i][colIndex]).trim()
-				: "";
-			rowData[header] = value;
-			if (value) hasValue = true;
-		});
-		if (hasValue) rows.push(rowData);
-	}
-
-	return { rows, columns: headers.filter(Boolean) };
+	return {
+		rows,
+		columns: headers,
+		sheetTitle: title,
+		sheetGid: sheetInfo.properties.sheetId,
+	};
 }
 
 async function processCopyMatrix(matrixId, { draft = false } = {}) {
@@ -182,11 +193,17 @@ async function processCopyMatrix(matrixId, { draft = false } = {}) {
 
 		const inserted = await saveRows(matrixId, result.rows);
 
-		matrixDoc.columns = result.columns;
+		matrixDoc.columns = ensureRowIdColumn(result.columns);
 		matrixDoc.processedRows = inserted;
 		matrixDoc.status = draft ? "draft" : "completed";
+		if (matrixDoc.inputType === "gsheet" && result.sheetTitle) {
+			matrixDoc.sheetGid = result.sheetGid;
+			matrixDoc.fileName = result.sheetTitle;
+		}
 		matrixDoc.message = draft
-			? `Preview ready — ${inserted} rows parsed`
+			? result.sheetTitle
+				? `Preview ready — ${inserted} rows from "${result.sheetTitle}"`
+				: `Preview ready — ${inserted} rows parsed`
 			: `Imported ${inserted} rows successfully`;
 		await matrixDoc.save();
 	} catch (err) {

@@ -2,6 +2,11 @@ const ExcelJS = require("exceljs");
 const fs = require("fs");
 const { processBatch } = require("../batchLogic");
 const { getExcelCellValue } = require("../helper");
+const {
+	buildHeadersFromHeaderRow,
+	rowDataFromArray,
+	getWorksheetMaxColumn,
+} = require("../../../utils/sheetColumnHelpers");
 
 const BATCH_SIZE = 1000;
 const ROW_LIMIT = 40000; // 🛑 STRICT LIMIT
@@ -31,34 +36,34 @@ async function processMemoryXLSX(uploadDoc, uniqueKey, seenKeys, fileHash, userI
 	let batch = [];
 	let stats = { created: 0, updated: 0, skipped: 0 };
 	let validationErrors = [];
-	let headers = [];
+	const maxCol = getWorksheetMaxColumn(worksheet);
+	const headerCells = [];
 
-	for (let i = 1; i <= worksheet.rowCount; i++) {
+	for (let col = 1; col <= maxCol; col++) {
+		headerCells[col - 1] = getExcelCellValue(
+			worksheet.getRow(1).getCell(col).value
+		);
+	}
+
+	const headers = buildHeadersFromHeaderRow(headerCells, maxCol);
+
+	if (!headers.includes(uniqueKey)) {
+		throw new Error(`Header "${uniqueKey}" not found in Excel.`);
+	}
+
+	for (let i = 2; i <= worksheet.rowCount; i++) {
 		const row = worksheet.getRow(i);
+		const rowArr = [];
 
-		// Headers (Row 1)
-		if (i === 1) {
-			row.eachCell(
-				{ includeEmpty: true },
-				(c, col) => (headers[col] = getExcelCellValue(c.value))
-			);
-			if (!headers.includes(uniqueKey))
-				throw new Error(`Header "${uniqueKey}" not found in Excel.`);
-			continue;
+		for (let col = 1; col <= maxCol; col++) {
+			const val = getExcelCellValue(row.getCell(col).value);
+			rowArr[col - 1] = val ? String(val).trim() : "";
 		}
 
-		// Data Rows
-		const rowData = {};
-		let hasRealData = false;
-		row.eachCell({ includeEmpty: true }, (c, col) => {
-			if (headers[col]) {
-				const val = getExcelCellValue(c.value);
-				rowData[headers[col]] = val;
-				if (val !== "") {
-					hasRealData = true;
-				}
-			}
-		});
+		const { rowData, hasValue: hasRealData } = rowDataFromArray(
+			rowArr,
+			headers
+		);
 
 		if (!hasRealData) continue; // Skip truly empty rows
 

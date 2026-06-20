@@ -1,6 +1,12 @@
 const csv = require("csv-parser");
 const storageService = require("../../storage");
 const { processBatch } = require("../batchLogic");
+const {
+	rowArrayFromRecord,
+	buildHeadersFromHeaderRow,
+	rowDataFromArray,
+	makeUniqueHeader,
+} = require("../../../utils/sheetColumnHelpers");
 
 const BATCH_SIZE = 1000;
 const MAX_VALIDATION_ERRORS = 100; // Limit error logging to prevent DB bloat
@@ -8,20 +14,32 @@ const MAX_VALIDATION_ERRORS = 100; // Limit error logging to prevent DB bloat
 async function processStreamCSV(uploadDoc, uniqueKey, seenKeys, fileHash, userId) {
 	const stream = storageService
 		.getReadStream(uploadDoc.fileRef)
-		.pipe(csv({ mapHeaders: ({ header }) => header.trim() }));
-	
+		.pipe(csv({ headers: false }));
+
 	let batch = [];
 	let stats = { created: 0, updated: 0, skipped: 0 };
 	let validationErrors = [];
 	let rowIndex = 0;
+	let headers = null;
 
 	for await (const row of stream) {
-		rowIndex++;
+		const rowArr = rowArrayFromRecord(row);
 
-		// Clean row data
-		const cleanRow = {};
-		for (const key in row)
-			cleanRow[key] = row[key] ? row[key].trim() : "";
+		if (rowIndex === 0) {
+			headers = buildHeadersFromHeaderRow(rowArr, rowArr.length);
+			rowIndex++;
+			continue;
+		}
+
+		if (rowArr.length > headers.length) {
+			const usedNames = new Set(headers);
+			for (let i = headers.length; i < rowArr.length; i++) {
+				headers.push(makeUniqueHeader(`Column ${i + 1}`, usedNames));
+			}
+		}
+
+		rowIndex++;
+		const { rowData: cleanRow } = rowDataFromArray(rowArr, headers);
 
 		const keyVal = cleanRow[uniqueKey];
 

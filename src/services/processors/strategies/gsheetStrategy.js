@@ -1,5 +1,15 @@
 const { google } = require("googleapis");
 const { processBatch } = require("../batchLogic");
+const {
+	extractSheetId,
+	extractGid,
+	resolveSheetFromMeta,
+} = require("../../../utils/gsheetHelpers");
+const {
+	buildHeadersFromHeaderRow,
+	rowDataFromArray,
+	makeUniqueHeader,
+} = require("../../../utils/sheetColumnHelpers");
 const BATCH_SIZE = 1000;
 const ROW_LIMIT = 40000; // 🛑 STRICT LIMIT FOR GSHEETS
 const MAX_VALIDATION_ERRORS = 100;
@@ -12,11 +22,16 @@ const auth = new google.auth.GoogleAuth({
 
 async function processGoogleSheet(uploadDoc, uniqueKey, seenKeys, fileHash, userId) {
 	const sheets = google.sheets({ version: "v4", auth });
-	const sheetId = uploadDoc.fileRef;
+	const spreadsheetId = extractSheetId(uploadDoc.fileRef);
+	const gid = extractGid(uploadDoc.fileRef);
 
 	// 1. Get Metadata to check limits
-	const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId });
-	const sheetInfo = meta.data.sheets[0];
+	const meta = await sheets.spreadsheets.get({ spreadsheetId });
+	const sheetInfo = resolveSheetFromMeta(meta.data.sheets, gid);
+	if (!sheetInfo) {
+		throw new Error("No sheets found in spreadsheet");
+	}
+
 	const title = sheetInfo.properties.title;
 	const totalRows = sheetInfo.properties.gridProperties.rowCount; // Total physical rows
 
@@ -31,17 +46,40 @@ async function processGoogleSheet(uploadDoc, uniqueKey, seenKeys, fileHash, user
 		);
 	}
 
-	// 2. Get Headers
+	// 2. Get Headers (scan full sheet width, not just first row length)
 	const hRes = await sheets.spreadsheets.values.get({
-		spreadsheetId: sheetId,
-		range: `${escapedTitle}!1:1`,
+		spreadsheetId,
+		range: `${escapedTitle}!A1:ZZ1`,
 	});
-	const headers = hRes.data.values
-		? hRes.data.values[0].map((h) => h.trim())
-		: [];
+	const headerRow = hRes.data.values?.[0] || [];
 
-	if (!headers.includes(uniqueKey))
+	const probeEnd = Math.min(totalRows, 1000);
+	const probeRes = await sheets.spreadsheets.values.get({
+		spreadsheetId,
+		range: `${escapedTitle}!A1:ZZ${probeEnd}`,
+	});
+	const probeRows = probeRes.data.values || [];
+	const initialMaxCols = probeRows.reduce(
+		(max, row) => Math.max(max, row.length),
+		headerRow.length
+	);
+
+	let headers = buildHeadersFromHeaderRow(headerRow, initialMaxCols);
+
+	if (!headers.includes(uniqueKey)) {
 		throw new Error(`Header "${uniqueKey}" not found in Google Sheet.`);
+	}
+
+	const expandHeaders = (width) => {
+		if (width <= headers.length) return;
+		const usedNames = new Set(headers);
+		for (let i = headers.length; i < width; i++) {
+			const fromHeader = headerRow[i] ? String(headerRow[i]).trim() : "";
+			headers.push(
+				makeUniqueHeader(fromHeader || `Column ${i + 1}`, usedNames)
+			);
+		}
+	};
 
 	let stats = { created: 0, updated: 0, skipped: 0 };
 	let validationErrors = [];
@@ -61,21 +99,24 @@ async function processGoogleSheet(uploadDoc, uniqueKey, seenKeys, fileHash, user
 
 		try {
 			const res = await sheets.spreadsheets.values.get({
-				spreadsheetId: sheetId,
+				spreadsheetId,
 				range,
 			});
 
 			// If API returns empty (no data in range), break
 			if (!res.data.values || res.data.values.length === 0) break;
 
+			const batchMaxCols = res.data.values.reduce(
+				(max, rowArr) => Math.max(max, rowArr.length),
+				headers.length
+			);
+			expandHeaders(batchMaxCols);
+
 			const batch = [];
 
 			res.data.values.forEach((rowArr, idx) => {
 				const realRowNumber = currentRow + idx;
-				const obj = {};
-				headers.forEach(
-					(h, i) => (obj[h] = rowArr[i] ? rowArr[i].trim() : "")
-				);
+				const { rowData: obj } = rowDataFromArray(rowArr, headers);
 
 				const keyVal = obj[uniqueKey];
 

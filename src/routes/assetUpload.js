@@ -167,10 +167,9 @@ assetRouter.post(
 
 			if (!finalUpload || finalUpload.status === "failed") {
 				return res.status(500).json({
-					message: "Processing failed",
-					error: finalUpload
-						? finalUpload.message
-						: "Unknown processing error",
+					message:
+						finalUpload?.message ||
+						"Could not process the file. Check the format and try again.",
 				});
 			}
 
@@ -188,8 +187,9 @@ assetRouter.post(
 			cleanup();
 			console.error("Upload Error:", err);
 			res.status(500).json({
-				message: "File upload failed",
-				error: err.message,
+				message:
+					err.message ||
+					"File upload failed. Please check your file and try again.",
 			});
 		}
 	},
@@ -263,10 +263,9 @@ assetRouter.put(
 
 			if (!finalUpload || finalUpload.status === "failed") {
 				return res.status(500).json({
-					message: "Processing failed",
-					error: finalUpload
-						? finalUpload.message
-						: "Unknown processing error",
+					message:
+						finalUpload?.message ||
+						"Could not process the file. Check the format and try again.",
 				});
 			}
 
@@ -286,8 +285,9 @@ assetRouter.put(
 			cleanup();
 			console.error("Retry Upload Error:", err);
 			res.status(500).json({
-				message: "File update failed",
-				error: err.message,
+				message:
+					err.message ||
+					"File update failed. Please check your file and try again.",
 			});
 		}
 	},

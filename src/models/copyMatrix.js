@@ -24,6 +24,7 @@ const CopyMatrixSchema = new mongoose.Schema(
 			enum: ["csv", "xlsx", "GSheet"],
 		},
 		fileRef: String,
+		sheetGid: Number,
 		fileHash: String,
 		columns: [String],
 		status: {

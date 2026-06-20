@@ -14,6 +14,17 @@ const {
 	resolveLinkedAssetUpload,
 } = require("../services/copyMatrixToAssetSource");
 const {
+	extractSheetId,
+	extractGid,
+	listSheetsFromMeta,
+} = require("../utils/gsheetHelpers");
+const {
+	AUTO_ROW_ID_COLUMN,
+	ensureRowIdColumn,
+	injectRowIdIntoRowData,
+} = require("../constants/copyMatrix");
+const { google } = require("googleapis");
+const {
 	logCopyMatrixRowChanges,
 	logCopyMatrixAction,
 } = require("../services/copyMatrixHistory");
@@ -26,6 +37,21 @@ const upload = multer({
 	dest: "temp_uploads/",
 	limits: { fileSize: 500 * 1024 * 1024 },
 });
+
+const gsheetAuth = new google.auth.GoogleAuth({
+	keyFile: "google-credentials.json",
+	scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+});
+
+async function fetchSpreadsheetSheets(fileRef) {
+	const sheetsApi = google.sheets({ version: "v4", auth: gsheetAuth });
+	const spreadsheetId = extractSheetId(fileRef);
+	const meta = await sheetsApi.spreadsheets.get({ spreadsheetId });
+	return {
+		spreadsheetId,
+		sheets: listSheetsFromMeta(meta.data.sheets),
+	};
+}
 
 const mapListStatus = (status) => {
 	if (status === "completed" || status === "partial_success") return "Active";
@@ -66,7 +92,7 @@ const handlePreviewUpload = async (req, res) => {
 	};
 
 	try {
-		const { accountId, name, inputType, fileRef } = req.body;
+		const { accountId, name, inputType, fileRef, sheetGid } = req.body;
 		const isGSheet = inputType === "gsheet";
 
 		if (!isGSheet && !req.file) {
@@ -83,6 +109,8 @@ const handlePreviewUpload = async (req, res) => {
 		}
 
 		let finalFileRef = isGSheet ? fileRef.trim() : "";
+		let resolvedSheetGid = null;
+		let sheetTitle = null;
 		let fileHash = "";
 		let fileName = "";
 		let fileType = "";
@@ -104,13 +132,38 @@ const handlePreviewUpload = async (req, res) => {
 				matrixName = fileName.replace(/\.[^.]+$/, "");
 			}
 		} else {
+			const gidFromBody =
+				sheetGid != null && sheetGid !== ""
+					? Number(sheetGid)
+					: null;
+			const gidFromUrl = extractGid(fileRef);
+			resolvedSheetGid =
+				gidFromBody != null && !Number.isNaN(gidFromBody)
+					? gidFromBody
+					: gidFromUrl;
+
+			try {
+				const { sheets } = await fetchSpreadsheetSheets(fileRef);
+				const selected = sheets.find(
+					(s) => Number(s.sheetId) === Number(resolvedSheetGid)
+				);
+				if (selected) {
+					sheetTitle = selected.title;
+				} else if (sheets.length > 0) {
+					resolvedSheetGid = sheets[0].sheetId;
+					sheetTitle = sheets[0].title;
+				}
+			} catch (err) {
+				console.warn("[CopyMatrix] Could not resolve sheet tab:", err.message);
+			}
+
 			fileHash = crypto
 				.createHash("md5")
 				.update(fileRef.trim() + "_" + Date.now())
 				.digest("hex");
-			fileName = "Google Sheet";
+			fileName = sheetTitle || "Google Sheet";
 			fileType = "GSheet";
-			if (!matrixName) matrixName = "Copy Matrix";
+			if (!matrixName) matrixName = sheetTitle || "Copy Matrix";
 		}
 
 		const matrix = await CopyMatrix.create({
@@ -120,6 +173,7 @@ const handlePreviewUpload = async (req, res) => {
 			inputType: inputType || "file",
 			fileType,
 			fileRef: finalFileRef,
+			sheetGid: resolvedSheetGid,
 			fileHash,
 			status: "pending",
 			updatedBy: req.user._id,
@@ -132,10 +186,9 @@ const handlePreviewUpload = async (req, res) => {
 			await CopyMatrix.findByIdAndDelete(matrix._id);
 			await CopyMatrixRow.deleteMany({ copyMatrixId: matrix._id });
 			return res.status(500).json({
-				message: "Processing failed",
-				error: finalMatrix
-					? finalMatrix.message
-					: "Unknown processing error",
+				message:
+					finalMatrix?.message ||
+					"Could not process the file. Check the format and try again.",
 			});
 		}
 
@@ -148,14 +201,17 @@ const handlePreviewUpload = async (req, res) => {
 				processedRows: finalMatrix.processedRows,
 				columns: finalMatrix.columns,
 				fileName: finalMatrix.fileName,
+				sheetGid: finalMatrix.sheetGid,
+				sheetTitle: sheetTitle || finalMatrix.fileName,
 			},
 		});
 	} catch (err) {
 		cleanup();
 		console.error("Copy matrix preview error:", err);
 		res.status(500).json({
-			message: "Preview failed",
-			error: err.message,
+			message:
+				err.message ||
+				"Could not preview the copy matrix. Please check your file and try again.",
 		});
 	}
 };
@@ -263,11 +319,11 @@ copyMatrixRouter.get(
 			res.status(200).json({
 				message: "Rows fetched successfully",
 				data: {
-					columns: matrix.columns || [],
+					columns: ensureRowIdColumn(matrix.columns || []),
 					rows: rows.map((row) => ({
 						_id: row._id,
 						rowIndex: row.rowIndex,
-						...row.rowData,
+						...injectRowIdIntoRowData(row.rowData || {}, row.rowIndex),
 					})),
 					pagination: {
 						page,
@@ -302,8 +358,10 @@ copyMatrixRouter.get(
 				.sort({ rowIndex: 1 })
 				.lean();
 
-			const columns = matrix.columns || [];
-			const rows = cmRows.map((row) => row.rowData || {});
+			const columns = ensureRowIdColumn(matrix.columns || []);
+			const rows = cmRows.map((row) =>
+				injectRowIdIntoRowData(row.rowData || {}, row.rowIndex)
+			);
 			const csv = buildCsv(columns, rows);
 			sendCsv(res, matrix.name || "copy-matrix", csv);
 		} catch (err) {
@@ -333,7 +391,8 @@ copyMatrixRouter.get("/copy-matrix/:id", userAuth, async (req, res) => {
 				name: matrix.name,
 				fileName: matrix.fileName,
 				status: matrix.status,
-				columns: matrix.columns || [],
+				columns: ensureRowIdColumn(matrix.columns || []),
+				defaultUniqueColumn: AUTO_ROW_ID_COLUMN,
 				processedRows: matrix.processedRows,
 				message: matrix.message,
 				validationErrors: matrix.validationErrors,
@@ -354,6 +413,42 @@ copyMatrixRouter.get("/copy-matrix/:id", userAuth, async (req, res) => {
 		res.status(500).json({ message: "Failed to fetch copy matrix" });
 	}
 });
+
+copyMatrixRouter.post(
+	"/copy-matrix/gsheet/sheets",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { fileRef } = req.body;
+			if (!fileRef?.trim()) {
+				return res
+					.status(400)
+					.json({ message: "Google Sheet URL is required" });
+			}
+
+			const { spreadsheetId, sheets } = await fetchSpreadsheetSheets(
+				fileRef
+			);
+			const defaultGid = extractGid(fileRef);
+
+			res.status(200).json({
+				message: "Sheets fetched successfully",
+				data: {
+					spreadsheetId,
+					defaultGid,
+					sheets,
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(500).json({
+				message:
+					err.message ||
+					"Could not load Google Sheet tabs. Check the URL and sharing settings.",
+			});
+		}
+	}
+);
 
 copyMatrixRouter.post(
 	"/copy-matrix/preview",
@@ -390,12 +485,13 @@ copyMatrixRouter.put("/copy-matrix/:id/rows", userAuth, async (req, res) => {
 				matrix._id,
 				req.user._id
 			);
-			assetUploadId = toIdString(synced?._id) || assetUploadId;
+			assetUploadId =
+				toIdString(synced?.upload?._id) || assetUploadId;
 			await logCopyMatrixAction(matrix._id, req.user._id, "sync", [
 				{
 					field: "syncedRows",
 					oldValue: null,
-					newValue: synced?.processedRows ?? 0,
+					newValue: synced?.upload?.processedRows ?? 0,
 				},
 			]);
 		}
@@ -448,14 +544,15 @@ copyMatrixRouter.post(
 				req.user._id
 			);
 			const assetUploadId =
-				toIdString(synced?._id) || toIdString(linkedUpload._id);
+				toIdString(synced?.upload?._id) ||
+				toIdString(linkedUpload._id);
 
 			if (Array.isArray(rows) && rows.length > 0) {
 				await logCopyMatrixAction(freshMatrix._id, req.user._id, "sync", [
 					{
 						field: "syncedRows",
 						oldValue: null,
-						newValue: synced?.processedRows ?? 0,
+						newValue: synced?.upload?.processedRows ?? 0,
 					},
 				]);
 			}
@@ -470,7 +567,9 @@ copyMatrixRouter.post(
 			});
 		} catch (err) {
 			console.error(err);
-			res.status(500).json({ message: "Failed to save copy matrix" });
+			res.status(500).json({
+				message: err.message || "Failed to save copy matrix",
+			});
 		}
 	}
 );
@@ -511,13 +610,24 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 
 		const prevStatus = matrix.status;
 		let assetUpload = linkedUpload;
+		let uniqueColumnNotice = null;
 
 		if (!assetUpload) {
-			assetUpload = await createAssetSourceFromCopyMatrix(
+			const created = await createAssetSourceFromCopyMatrix(
 				matrix,
 				req.user._id,
 				uniqueColumn
 			);
+			assetUpload = created.upload;
+			uniqueColumnNotice = created.uniqueColumnNotice;
+		} else if (prevStatus === "draft") {
+			const synced = await syncAssetSourceFromCopyMatrix(
+				matrix._id,
+				req.user._id,
+				uniqueColumn
+			);
+			assetUpload = synced.upload;
+			uniqueColumnNotice = synced.uniqueColumnNotice;
 		}
 
 		matrix.status = "completed";
@@ -538,18 +648,24 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 		}
 
 		res.status(200).json({
-			message: "Copy matrix saved — continue editing asset source",
+			message: uniqueColumnNotice
+				? uniqueColumnNotice
+				: "Copy matrix saved — continue editing asset source",
 			data: {
 				copyMatrixId: matrix._id,
 				assetUploadId: toIdString(assetUpload._id),
 				name: matrix.name,
 				status: mapListStatus(matrix.status),
 				processedRows: matrix.processedRows,
+				uniqueColumn: assetUpload.uniqueColumn,
+				uniqueColumnNotice,
 			},
 		});
 	} catch (err) {
 		console.error(err);
-		res.status(500).json({ message: "Failed to save copy matrix" });
+		res.status(500).json({
+			message: err.message || "Failed to save copy matrix",
+		});
 	}
 });
 
