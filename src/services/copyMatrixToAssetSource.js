@@ -28,25 +28,111 @@ function buildPrimaryKey(rowData, keyColumn, rowIndex) {
 }
 
 async function isColumnUnique(copyMatrixId, keyColumn) {
+	const result = await analyzeColumnUniqueness(copyMatrixId, keyColumn);
+	return result.unique;
+}
+
+/**
+ * Analyze whether a column is unique across all copy-matrix rows.
+ * Returns duplicate groups with row indexes / ids for UI highlighting.
+ */
+async function analyzeColumnUniqueness(copyMatrixId, keyColumn) {
 	if (isAutoRowIdColumn(keyColumn)) {
-		return true;
+		return {
+			unique: true,
+			column: keyColumn,
+			duplicates: [],
+			emptyRowIndexes: [],
+			emptyRowIds: [],
+			message: null,
+		};
 	}
 
 	const cmRows = await CopyMatrixRow.find({ copyMatrixId })
-		.select("rowData rowIndex")
+		.select("_id rowData rowIndex")
 		.sort({ rowIndex: 1 })
 		.lean();
 
-	const seen = new Set();
+	const byValue = new Map();
+	const emptyRows = [];
 
 	for (const row of cmRows) {
 		const key = normalizeKeyValue(row.rowData?.[keyColumn]);
-		if (!key) return false;
-		if (seen.has(key)) return false;
-		seen.add(key);
+		if (!key) {
+			emptyRows.push({
+				rowId: String(row._id),
+				rowIndex: row.rowIndex,
+			});
+			continue;
+		}
+		if (!byValue.has(key)) {
+			byValue.set(key, []);
+		}
+		byValue.get(key).push({
+			rowId: String(row._id),
+			rowIndex: row.rowIndex,
+		});
 	}
 
-	return true;
+	const duplicates = [];
+	for (const [value, rows] of byValue.entries()) {
+		if (rows.length > 1) {
+			duplicates.push({
+				value,
+				count: rows.length,
+				rowIndexes: rows.map((r) => r.rowIndex),
+				rowIds: rows.map((r) => r.rowId),
+			});
+		}
+	}
+
+	const emptyRowIndexes = emptyRows.map((r) => r.rowIndex);
+	const emptyRowIds = emptyRows.map((r) => r.rowId);
+
+	const unique =
+		duplicates.length === 0 && emptyRows.length === 0;
+
+	let message = null;
+	if (!unique) {
+		const parts = [];
+		if (duplicates.length > 0) {
+			const samples = duplicates
+				.slice(0, 3)
+				.map(
+					(d) =>
+						`"${d.value}" (rows ${d.rowIndexes.join(", ")})`
+				)
+				.join("; ");
+			parts.push(
+				`Duplicate values in "${keyColumn}": ${samples}${
+					duplicates.length > 3
+						? ` and ${duplicates.length - 3} more`
+						: ""
+				}`
+			);
+		}
+		if (emptyRows.length > 0) {
+			parts.push(
+				`Empty values in "${keyColumn}" at rows ${emptyRowIndexes
+					.slice(0, 8)
+					.join(", ")}${
+					emptyRows.length > 8
+						? ` and ${emptyRows.length - 8} more`
+						: ""
+				}`
+			);
+		}
+		message = parts.join(". ");
+	}
+
+	return {
+		unique,
+		column: keyColumn,
+		duplicates,
+		emptyRowIndexes,
+		emptyRowIds,
+		message,
+	};
 }
 
 async function resolveUniqueColumnWithFallback(
@@ -64,7 +150,8 @@ async function resolveUniqueColumnWithFallback(
 		};
 	}
 
-	if (await isColumnUnique(copyMatrixId, requested)) {
+	const analysis = await analyzeColumnUniqueness(copyMatrixId, requested);
+	if (analysis.unique) {
 		return {
 			keyColumn: requested,
 			requestedColumn: requested,
@@ -75,7 +162,9 @@ async function resolveUniqueColumnWithFallback(
 	return {
 		keyColumn: AUTO_ROW_ID_COLUMN,
 		requestedColumn: requested,
-		notice: `Selected column "${requested}" is not unique. Using "${AUTO_ROW_ID_COLUMN}" as the unique column.`,
+		notice: `${analysis.message}. Using "${AUTO_ROW_ID_COLUMN}" as the unique column.`,
+		duplicates: analysis.duplicates,
+		emptyRowIndexes: analysis.emptyRowIndexes,
 	};
 }
 
@@ -284,6 +373,7 @@ module.exports = {
 	clearCopyMatrixAssetUploadLink,
 	resolveUniqueColumnWithFallback,
 	isColumnUnique,
+	analyzeColumnUniqueness,
 	AUTO_ROW_ID_COLUMN,
 	resolveUniqueColumn,
 };

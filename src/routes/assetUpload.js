@@ -21,6 +21,10 @@ const {
 	isDuplicateNameError,
 } = require("../utils/nameValidation");
 const { formatApiError } = require("../utils/apiErrors");
+const {
+	normalizeRowDataValues,
+	normalizeCellText,
+} = require("../constants/copyMatrix");
 
 const assetRouter = express.Router();
 
@@ -633,7 +637,7 @@ assetRouter.get("/source/:id/rows", userAuth, async (req, res) => {
 					_id: row._id,
 					rowIndex: row.cmRowIndex ?? skip + idx + 1,
 					primaryKey: row.primaryKey,
-					...row.rowData,
+					...normalizeRowDataValues(row.rowData || {}),
 				})),
 				pagination: {
 					page,
@@ -673,9 +677,11 @@ assetRouter.put("/source/:id/rows", userAuth, async (req, res) => {
 			const asset = await AssetSource.findById(item._id);
 			if (!asset || String(asset.uploadId) !== String(upload._id)) continue;
 
-			asset.rowData = item.rowData;
+			asset.rowData = normalizeRowDataValues(item.rowData);
 			if (item.rowData[keyColumn] != null) {
-				asset.primaryKey = String(item.rowData[keyColumn]).trim();
+				asset.primaryKey = normalizeCellText(
+					item.rowData[keyColumn]
+				);
 			}
 			await asset.save();
 		}

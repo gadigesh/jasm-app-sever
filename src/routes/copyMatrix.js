@@ -12,7 +12,17 @@ const {
 	createAssetSourceFromCopyMatrix,
 	syncAssetSourceFromCopyMatrix,
 	resolveLinkedAssetUpload,
+	analyzeColumnUniqueness,
 } = require("../services/copyMatrixToAssetSource");
+const {
+	fillColumnSequence,
+	copyFromOtherColumn,
+	fillColumnDate,
+	replaceInColumn,
+	applyColumnCellChanges,
+	renameCopyMatrixColumn,
+	deleteCopyMatrixColumn,
+} = require("../services/copyMatrixColumnOps");
 const {
 	extractSheetId,
 	extractGid,
@@ -22,6 +32,8 @@ const {
 	AUTO_ROW_ID_COLUMN,
 	ensureRowIdColumn,
 	injectRowIdIntoRowData,
+	normalizeRowDataValues,
+	isAutoRowIdColumn,
 } = require("../constants/copyMatrix");
 const { google } = require("googleapis");
 const {
@@ -120,12 +132,149 @@ async function applyCopyMatrixRowUpdates(matrix, rows, userId) {
 		if (!item._id || !item.rowData) continue;
 		const row = await CopyMatrixRow.findById(item._id);
 		if (!row || String(row.copyMatrixId) !== String(matrix._id)) continue;
-		row.rowData = item.rowData;
+		row.rowData = normalizeRowDataValues(item.rowData);
 		await row.save();
 	}
 
 	matrix.updatedBy = userId;
 	await matrix.save();
+}
+
+async function refreshCopyMatrixRowCount(matrix) {
+	const count = await CopyMatrixRow.countDocuments({
+		copyMatrixId: matrix._id,
+	});
+	matrix.processedRows = count;
+	await matrix.save();
+	return count;
+}
+
+function buildEmptyRowData(columns = [], overrides = {}) {
+	const data = {};
+	for (const col of columns) {
+		data[col] = overrides[col] ?? "";
+	}
+	return data;
+}
+
+async function addCopyMatrixRow(matrix, userId, overrides = {}) {
+	const columns = ensureRowIdColumn(matrix.columns || []);
+	const maxRow = await CopyMatrixRow.findOne({ copyMatrixId: matrix._id })
+		.sort({ rowIndex: -1 })
+		.select("rowIndex")
+		.lean();
+	const newIndex = (maxRow?.rowIndex ?? 0) + 1;
+	const rowData = injectRowIdIntoRowData(
+		buildEmptyRowData(columns, overrides),
+		newIndex
+	);
+
+	const row = await CopyMatrixRow.create({
+		copyMatrixId: matrix._id,
+		rowIndex: newIndex,
+		rowData,
+	});
+
+	matrix.updatedBy = userId;
+	await refreshCopyMatrixRowCount(matrix);
+
+	return row;
+}
+
+async function addCopyMatrixColumn(matrix, columnName, userId) {
+	const trimmed = String(columnName || "").trim();
+	if (!trimmed) {
+		throw new Error("Column name is required");
+	}
+	if (isAutoRowIdColumn(trimmed)) {
+		throw new Error(`"${AUTO_ROW_ID_COLUMN}" is a reserved column name`);
+	}
+
+	const currentColumns = matrix.columns || [];
+	if (currentColumns.includes(trimmed)) {
+		throw new Error("A column with this name already exists");
+	}
+
+	const userColumns = currentColumns.filter((col) => !isAutoRowIdColumn(col));
+	matrix.columns = ensureRowIdColumn([...userColumns, trimmed]);
+
+	const rows = await CopyMatrixRow.find({ copyMatrixId: matrix._id });
+	for (const row of rows) {
+		row.rowData = {
+			...(row.rowData || {}),
+			[trimmed]: "",
+		};
+		await row.save();
+	}
+
+	matrix.updatedBy = userId;
+	await matrix.save();
+	return matrix;
+}
+
+async function cloneCopyMatrixRow(matrix, sourceRowId, userId) {
+	const source = await CopyMatrixRow.findById(sourceRowId);
+	if (!source || String(source.copyMatrixId) !== String(matrix._id)) {
+		throw new Error("Source row not found");
+	}
+
+	const maxRow = await CopyMatrixRow.findOne({ copyMatrixId: matrix._id })
+		.sort({ rowIndex: -1 })
+		.select("rowIndex")
+		.lean();
+	const newIndex = (maxRow?.rowIndex ?? 0) + 1;
+
+	const clonedData = { ...(source.rowData || {}) };
+	delete clonedData._id;
+	const rowData = injectRowIdIntoRowData(clonedData, newIndex);
+
+	const row = await CopyMatrixRow.create({
+		copyMatrixId: matrix._id,
+		rowIndex: newIndex,
+		rowData,
+	});
+
+	matrix.updatedBy = userId;
+	await refreshCopyMatrixRowCount(matrix);
+
+	return row;
+}
+
+async function cloneCopyMatrixColumn(matrix, sourceColumn, newColumnName, userId) {
+	const trimmed = String(newColumnName || "").trim();
+	const columns = matrix.columns || [];
+
+	if (!sourceColumn || !columns.includes(sourceColumn)) {
+		throw new Error("Source column not found");
+	}
+	if (!trimmed) {
+		throw new Error("New column name is required");
+	}
+	if (isAutoRowIdColumn(trimmed)) {
+		throw new Error(`"${AUTO_ROW_ID_COLUMN}" is a reserved column name`);
+	}
+	if (columns.includes(trimmed)) {
+		throw new Error("A column with this name already exists");
+	}
+
+	const userColumns = columns.filter((col) => !isAutoRowIdColumn(col));
+	const sourceIndex = userColumns.indexOf(sourceColumn);
+	const nextColumns = [...userColumns];
+	nextColumns.splice(sourceIndex + 1, 0, trimmed);
+	matrix.columns = ensureRowIdColumn(nextColumns);
+
+	const rows = await CopyMatrixRow.find({ copyMatrixId: matrix._id });
+	for (const row of rows) {
+		row.rowData = {
+			...(row.rowData || {}),
+			[trimmed]: row.rowData?.[sourceColumn] ?? "",
+		};
+		await row.save();
+	}
+
+	matrix.updatedBy = userId;
+	await matrix.save();
+	return matrix;
 }
 
 const handlePreviewUpload = async (req, res) => {
@@ -458,7 +607,10 @@ copyMatrixRouter.get(
 					rows: rows.map((row) => ({
 						_id: row._id,
 						rowIndex: row.rowIndex,
-						...injectRowIdIntoRowData(row.rowData || {}, row.rowIndex),
+						...injectRowIdIntoRowData(
+							normalizeRowDataValues(row.rowData || {}),
+							row.rowIndex
+						),
 					})),
 					pagination: {
 						page,
@@ -647,6 +799,44 @@ copyMatrixRouter.post(
 	handlePreviewUpload
 );
 
+copyMatrixRouter.post(
+	"/copy-matrix/:id/check-unique-column",
+	userAuth,
+	async (req, res) => {
+		try {
+			const column = req.body?.column?.trim();
+			if (!column) {
+				return res
+					.status(400)
+					.json({ message: "Column name is required" });
+			}
+
+			const matrix = await CopyMatrix.findById(req.params.id).select(
+				"_id columns"
+			);
+			if (!matrix) {
+				return res
+					.status(404)
+					.json({ message: "Copy matrix not found" });
+			}
+
+			const analysis = await analyzeColumnUniqueness(matrix._id, column);
+
+			res.status(200).json({
+				message: analysis.unique
+					? "Column is unique"
+					: "Column is not unique",
+				data: analysis,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(500).json({
+				message: formatApiError(err, "Failed to check unique column"),
+			});
+		}
+	}
+);
+
 copyMatrixRouter.put("/copy-matrix/:id/rows", userAuth, async (req, res) => {
 	try {
 		const { rows } = req.body;
@@ -693,6 +883,383 @@ copyMatrixRouter.put("/copy-matrix/:id/rows", userAuth, async (req, res) => {
 		});
 	}
 });
+
+copyMatrixRouter.post("/copy-matrix/:id/rows/add", userAuth, async (req, res) => {
+	try {
+		const matrix = await CopyMatrix.findById(req.params.id);
+		if (!matrix) {
+			return res.status(404).json({ message: "Copy matrix not found" });
+		}
+
+		const row = await addCopyMatrixRow(
+			matrix,
+			req.user._id,
+			req.body?.rowData || {}
+		);
+
+		res.status(201).json({
+			message: "Row added successfully",
+			data: {
+				row: {
+					_id: row._id,
+					rowIndex: row.rowIndex,
+					...injectRowIdIntoRowData(row.rowData || {}, row.rowIndex),
+				},
+				processedRows: matrix.processedRows,
+			},
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({
+			message: formatApiError(err, "Failed to add row"),
+		});
+	}
+});
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/columns/add",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { columnName } = req.body;
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const updated = await addCopyMatrixColumn(
+				matrix,
+				columnName,
+				req.user._id
+			);
+
+			res.status(201).json({
+				message: "Column added successfully",
+				data: {
+					columns: ensureRowIdColumn(updated.columns || []),
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(500).json({
+				message: formatApiError(err, "Failed to add column"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/rows/clone",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { sourceRowId } = req.body;
+			if (!sourceRowId) {
+				return res
+					.status(400)
+					.json({ message: "Source row is required" });
+			}
+
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const row = await cloneCopyMatrixRow(
+				matrix,
+				sourceRowId,
+				req.user._id
+			);
+
+			res.status(201).json({
+				message: "Row cloned successfully",
+				data: {
+					row: {
+						_id: row._id,
+						rowIndex: row.rowIndex,
+						...injectRowIdIntoRowData(row.rowData || {}, row.rowIndex),
+					},
+					processedRows: matrix.processedRows,
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(500).json({
+				message: formatApiError(err, "Failed to clone row"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/columns/clone",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { sourceColumn, newColumnName } = req.body;
+			if (!sourceColumn || !newColumnName?.trim()) {
+				return res.status(400).json({
+					message: "Source column and new column name are required",
+				});
+			}
+
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const updated = await cloneCopyMatrixColumn(
+				matrix,
+				sourceColumn,
+				newColumnName,
+				req.user._id
+			);
+
+			res.status(201).json({
+				message: "Column cloned successfully",
+				data: {
+					columns: ensureRowIdColumn(updated.columns || []),
+					newColumnName: String(newColumnName).trim(),
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(500).json({
+				message: formatApiError(err, "Failed to clone column"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/columns/fill-sequence",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { column, rowIds } = req.body;
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const result = await fillColumnSequence(
+				matrix,
+				column,
+				rowIds,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: "Sequence numbers applied",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to fill sequence"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/columns/copy-from",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { targetColumn, sourceColumn, rowIds } = req.body;
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const result = await copyFromOtherColumn(
+				matrix,
+				targetColumn,
+				sourceColumn,
+				rowIds,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: "Column values copied",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to copy from column"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/columns/fill-date",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { column, dateValue, rowIds } = req.body;
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const result = await fillColumnDate(
+				matrix,
+				column,
+				dateValue,
+				rowIds,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: "Date applied",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to fill date"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/columns/replace",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { column, find, replace, mode, rowIds } = req.body;
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const result = await replaceInColumn(
+				matrix,
+				column,
+				find,
+				replace,
+				mode,
+				rowIds,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: result.message || "Replace completed",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to replace"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/columns/apply-changes",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { column, changes } = req.body;
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const result = await applyColumnCellChanges(
+				matrix,
+				column,
+				changes,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: `Applied ${result.updated} change${
+					result.updated === 1 ? "" : "s"
+				}`,
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to apply changes"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.put(
+	"/copy-matrix/:id/columns/rename",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { oldName, newName } = req.body;
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const updated = await renameCopyMatrixColumn(
+				matrix,
+				oldName,
+				newName,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: "Column renamed successfully",
+				data: {
+					columns: ensureRowIdColumn(updated.columns || []),
+					oldName,
+					newName: String(newName || "").trim(),
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to rename column"),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/columns/delete",
+	userAuth,
+	async (req, res) => {
+		try {
+			const { column } = req.body;
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res.status(404).json({ message: "Copy matrix not found" });
+			}
+
+			const updated = await deleteCopyMatrixColumn(
+				matrix,
+				column,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: "Column deleted successfully",
+				data: {
+					columns: ensureRowIdColumn(updated.columns || []),
+					deletedColumn: column,
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to delete column"),
+			});
+		}
+	}
+);
 
 copyMatrixRouter.post(
 	"/copy-matrix/:id/save-and-continue",
