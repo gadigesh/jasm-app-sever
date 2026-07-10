@@ -127,12 +127,30 @@ async function insertRowsFromCopyMatrix(
 	return inserted;
 }
 
-async function createAssetSourceFromCopyMatrix(matrix, userId, uniqueColumn) {
+async function clearCopyMatrixAssetUploadLink(matrixId, assetUploadId = null) {
+	const filter = { _id: matrixId };
+	if (assetUploadId) {
+		filter.assetUploadId = assetUploadId;
+	}
+	await CopyMatrix.updateOne(filter, { $unset: { assetUploadId: "" } });
+}
+
+async function createAssetSourceFromCopyMatrix(
+	matrix,
+	userId,
+	uniqueColumn,
+	assetName = null
+) {
 	const { keyColumn, notice } = await resolveUniqueColumnWithFallback(
 		matrix._id,
 		uniqueColumn,
 		matrix.columns || []
 	);
+
+	const resolvedAssetName =
+		assetName === ""
+			? "New asset source"
+			: String(assetName || matrix.name || "").trim() || matrix.name;
 
 	const fileHash =
 		matrix.fileHash ||
@@ -140,7 +158,7 @@ async function createAssetSourceFromCopyMatrix(matrix, userId, uniqueColumn) {
 
 	const upload = await AssetUpload.create({
 		accountId: matrix.accountId,
-		assetName: matrix.name,
+		assetName: resolvedAssetName,
 		fileName: matrix.fileName || `${matrix.name}.csv`,
 		inputType: matrix.inputType || "file",
 		fileType: matrix.fileType || "csv",
@@ -189,6 +207,9 @@ async function resolveLinkedAssetUpload(matrix) {
 		if (linked && String(linked.copyMatrixId) === String(matrixId)) {
 			return linked;
 		}
+
+		await clearCopyMatrixAssetUploadLink(matrixId, matrix.assetUploadId);
+		matrix.assetUploadId = null;
 	}
 
 	const upload = await AssetUpload.findOne({
@@ -260,6 +281,7 @@ module.exports = {
 	createAssetSourceFromCopyMatrix,
 	syncAssetSourceFromCopyMatrix,
 	resolveLinkedAssetUpload,
+	clearCopyMatrixAssetUploadLink,
 	resolveUniqueColumnWithFallback,
 	isColumnUnique,
 	AUTO_ROW_ID_COLUMN,

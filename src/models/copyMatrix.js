@@ -63,6 +63,15 @@ const CopyMatrixSchema = new mongoose.Schema(
 			ref: "AssetUpload",
 			default: null,
 		},
+		lastDeletedAssetSourceName: {
+			type: String,
+			trim: true,
+			default: null,
+		},
+		deletedAssetSourceNames: {
+			type: [String],
+			default: [],
+		},
 	},
 	{ timestamps: true }
 );
