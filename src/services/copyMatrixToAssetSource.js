@@ -89,40 +89,33 @@ async function analyzeColumnUniqueness(copyMatrixId, keyColumn) {
 	const emptyRowIndexes = emptyRows.map((r) => r.rowIndex);
 	const emptyRowIds = emptyRows.map((r) => r.rowId);
 
-	const unique =
-		duplicates.length === 0 && emptyRows.length === 0;
+	// Only duplicate non-empty values block uniqueness.
+	// Empty cells are allowed — primary keys fall back to row_${rowIndex}.
+	const unique = duplicates.length === 0;
 
 	let message = null;
-	if (!unique) {
-		const parts = [];
-		if (duplicates.length > 0) {
-			const samples = duplicates
-				.slice(0, 3)
-				.map(
-					(d) =>
-						`"${d.value}" (rows ${d.rowIndexes.join(", ")})`
-				)
-				.join("; ");
-			parts.push(
-				`Duplicate values in "${keyColumn}": ${samples}${
-					duplicates.length > 3
-						? ` and ${duplicates.length - 3} more`
-						: ""
-				}`
-			);
-		}
+	if (duplicates.length > 0) {
+		const samples = duplicates
+			.slice(0, 3)
+			.map(
+				(d) =>
+					`"${d.value}" (rows ${d.rowIndexes.join(", ")})`
+			)
+			.join("; ");
+		message = `Duplicate values in "${keyColumn}": ${samples}${
+			duplicates.length > 3
+				? ` and ${duplicates.length - 3} more`
+				: ""
+		}`;
 		if (emptyRows.length > 0) {
-			parts.push(
-				`Empty values in "${keyColumn}" at rows ${emptyRowIndexes
-					.slice(0, 8)
-					.join(", ")}${
-					emptyRows.length > 8
-						? ` and ${emptyRows.length - 8} more`
-						: ""
-				}`
-			);
+			message += `. Also ${emptyRows.length} empty cell${
+				emptyRows.length === 1 ? "" : "s"
+			}`;
 		}
-		message = parts.join(". ");
+	} else if (emptyRows.length > 0) {
+		message = `${emptyRows.length} empty cell${
+			emptyRows.length === 1 ? "" : "s"
+		} in "${keyColumn}" — those rows will use a row-index key`;
 	}
 
 	return {
@@ -131,7 +124,8 @@ async function analyzeColumnUniqueness(copyMatrixId, keyColumn) {
 		duplicates,
 		emptyRowIndexes,
 		emptyRowIds,
-		message,
+		message: unique ? null : message,
+		emptyWarning: unique && emptyRows.length > 0 ? message : null,
 	};
 }
 
@@ -140,7 +134,10 @@ async function resolveUniqueColumnWithFallback(
 	requestedColumn,
 	columns = []
 ) {
-	const requested = requestedColumn?.trim() || AUTO_ROW_ID_COLUMN;
+	const requested =
+		requestedColumn?.trim() ||
+		resolveUniqueColumn(null, columns) ||
+		AUTO_ROW_ID_COLUMN;
 
 	if (isAutoRowIdColumn(requested)) {
 		return {
@@ -155,17 +152,20 @@ async function resolveUniqueColumnWithFallback(
 		return {
 			keyColumn: requested,
 			requestedColumn: requested,
-			notice: null,
+			notice: analysis.emptyWarning || null,
 		};
 	}
 
-	return {
-		keyColumn: AUTO_ROW_ID_COLUMN,
-		requestedColumn: requested,
-		notice: `${analysis.message}. Using "${AUTO_ROW_ID_COLUMN}" as the unique column.`,
-		duplicates: analysis.duplicates,
-		emptyRowIndexes: analysis.emptyRowIndexes,
-	};
+	// Do not silently switch to Row ID — keep the CM selection and surface the error.
+	const err = new Error(
+		analysis.message ||
+			`"${requested}" has duplicate values. Fix them or pick another unique column.`
+	);
+	err.statusCode = 400;
+	err.code = "UNIQUE_COLUMN_DUPLICATES";
+	err.duplicates = analysis.duplicates;
+	err.emptyRowIndexes = analysis.emptyRowIndexes;
+	throw err;
 }
 
 async function insertRowsFromCopyMatrix(
@@ -230,11 +230,19 @@ async function createAssetSourceFromCopyMatrix(
 	uniqueColumn,
 	assetName = null
 ) {
+	const requested =
+		uniqueColumn?.trim() ||
+		matrix.uniqueColumn?.trim() ||
+		null;
+
 	const { keyColumn, notice } = await resolveUniqueColumnWithFallback(
 		matrix._id,
-		uniqueColumn,
+		requested,
 		matrix.columns || []
 	);
+
+	// Persist the chosen unique column on the copy matrix as well
+	matrix.uniqueColumn = keyColumn;
 
 	const resolvedAssetName =
 		assetName === ""
@@ -273,7 +281,10 @@ async function createAssetSourceFromCopyMatrix(
 		await upload.save();
 
 		await CopyMatrix.findByIdAndUpdate(matrix._id, {
-			$set: { assetUploadId: upload._id },
+			$set: {
+				assetUploadId: upload._id,
+				uniqueColumn: keyColumn,
+			},
 		});
 
 		return { upload, uniqueColumnNotice: notice };
@@ -339,12 +350,14 @@ async function syncAssetSourceFromCopyMatrix(
 
 	const { keyColumn, notice } = await resolveUniqueColumnWithFallback(
 		matrixId,
-		uniqueColumn || fullUpload.uniqueColumn,
+		uniqueColumn || matrix.uniqueColumn || fullUpload.uniqueColumn,
 		matrix.columns || []
 	);
 	const importStatus = fullUpload.status === "draft" ? "DRAFT" : "ACTIVE";
 
 	fullUpload.uniqueColumn = keyColumn;
+	matrix.uniqueColumn = keyColumn;
+	await matrix.save();
 
 	await AssetSource.deleteMany({ uploadId: fullUpload._id });
 

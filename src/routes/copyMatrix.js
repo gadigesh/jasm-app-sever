@@ -544,6 +544,7 @@ copyMatrixRouter.get(
 				status: mapListStatus(matrix.status),
 				rawStatus: matrix.status,
 				rows: matrix.processedRows,
+				uniqueColumn: matrix.uniqueColumn || AUTO_ROW_ID_COLUMN,
 				createdBy: matrix.updatedBy
 					? matrix.updatedBy.firstName
 					: "Unknown",
@@ -723,7 +724,9 @@ copyMatrixRouter.get("/copy-matrix/:id", userAuth, async (req, res) => {
 				fileName: matrix.fileName,
 				status: matrix.status,
 				columns: ensureRowIdColumn(matrix.columns || []),
-				defaultUniqueColumn: AUTO_ROW_ID_COLUMN,
+				uniqueColumn: matrix.uniqueColumn || null,
+				defaultUniqueColumn:
+					matrix.uniqueColumn || AUTO_ROW_ID_COLUMN,
 				processedRows: matrix.processedRows,
 				message: matrix.message,
 				validationErrors: matrix.validationErrors,
@@ -883,6 +886,70 @@ copyMatrixRouter.put("/copy-matrix/:id/rows", userAuth, async (req, res) => {
 		});
 	}
 });
+
+async function reorderCopyMatrixColumns(matrix, orderedColumns, userId) {
+	if (!Array.isArray(orderedColumns) || orderedColumns.length === 0) {
+		const err = new Error("Column order is required");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	const current = matrix.columns || [];
+	const currentSet = new Set(current);
+	const nextUser = orderedColumns.filter((col) => !isAutoRowIdColumn(col));
+	const currentUser = current.filter((col) => !isAutoRowIdColumn(col));
+
+	if (nextUser.length !== currentUser.length) {
+		const err = new Error("Column list does not match existing columns");
+		err.statusCode = 400;
+		throw err;
+	}
+	for (const col of nextUser) {
+		if (!currentSet.has(col)) {
+			const err = new Error(`Unknown column: ${col}`);
+			err.statusCode = 400;
+			throw err;
+		}
+	}
+
+	matrix.columns = ensureRowIdColumn(nextUser);
+	matrix.updatedBy = userId;
+	await matrix.save();
+	return matrix;
+}
+
+copyMatrixRouter.put(
+	"/copy-matrix/:id/columns/reorder",
+	userAuth,
+	async (req, res) => {
+		try {
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res
+					.status(404)
+					.json({ message: "Copy matrix not found" });
+			}
+
+			const updated = await reorderCopyMatrixColumns(
+				matrix,
+				req.body?.columns,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: "Column order updated",
+				data: {
+					columns: ensureRowIdColumn(updated.columns || []),
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to reorder columns"),
+			});
+		}
+	}
+);
 
 copyMatrixRouter.post("/copy-matrix/:id/rows/add", userAuth, async (req, res) => {
 	try {
@@ -1358,6 +1425,10 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 				matrix._id
 			);
 
+			if (uniqueColumn?.trim()) {
+				matrix.uniqueColumn = uniqueColumn.trim();
+			}
+
 			const prevStatus = matrix.status;
 			matrix.status = "completed";
 			matrix.message = `Saved ${matrix.processedRows} rows successfully`;
@@ -1382,6 +1453,7 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 					copyMatrixId: matrix._id,
 					assetUploadId: null,
 					name: matrix.name,
+					uniqueColumn: matrix.uniqueColumn,
 					status: mapListStatus(matrix.status),
 					processedRows: matrix.processedRows,
 				},
@@ -1452,31 +1524,53 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 		let assetUpload = forceNewAssetSource ? null : linkedUpload;
 		let uniqueColumnNotice = null;
 
+		const fromBody =
+			typeof uniqueColumn === "string" ? uniqueColumn.trim() : "";
+		const fromMatrix =
+			typeof matrix.uniqueColumn === "string"
+				? matrix.uniqueColumn.trim()
+				: "";
+		// Body wins when provided; otherwise keep the CM selection.
+		const requestedUnique = fromBody || fromMatrix || null;
+
+		if (requestedUnique) {
+			matrix.uniqueColumn = requestedUnique;
+		}
+
 		if (!assetUpload) {
 			const created = await createAssetSourceFromCopyMatrix(
 				matrix,
 				req.user._id,
-				uniqueColumn,
+				requestedUnique || matrix.uniqueColumn,
 				forceNewAssetSource ? "" : null
 			);
 			assetUpload = created.upload;
 			uniqueColumnNotice = created.uniqueColumnNotice;
+			if (created.upload?.uniqueColumn) {
+				matrix.uniqueColumn = created.upload.uniqueColumn;
+			}
 		} else if (prevStatus === "draft") {
 			const synced = await syncAssetSourceFromCopyMatrix(
 				matrix._id,
 				req.user._id,
-				uniqueColumn
+				requestedUnique || matrix.uniqueColumn
 			);
 			assetUpload = synced.upload;
 			uniqueColumnNotice = synced.uniqueColumnNotice;
+			if (synced.upload?.uniqueColumn) {
+				matrix.uniqueColumn = synced.upload.uniqueColumn;
+			}
 		} else if (isRecreate && !forceNewAssetSource) {
 			const synced = await syncAssetSourceFromCopyMatrix(
 				matrix._id,
 				req.user._id,
-				uniqueColumn
+				requestedUnique || matrix.uniqueColumn
 			);
 			assetUpload = synced.upload;
 			uniqueColumnNotice = synced.uniqueColumnNotice;
+			if (synced.upload?.uniqueColumn) {
+				matrix.uniqueColumn = synced.upload.uniqueColumn;
+			}
 		}
 
 		if (!assetUpload) {
@@ -1543,8 +1637,9 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 		if (isDuplicateNameError(err)) {
 			return res.status(409).json({ message: err.message });
 		}
-		res.status(500).json({
+		res.status(err.statusCode || 500).json({
 			message: formatApiError(err, "Failed to save copy matrix"),
+			...(err.code ? { code: err.code } : {}),
 		});
 	}
 });
@@ -1644,7 +1739,7 @@ copyMatrixRouter.delete("/copy-matrix/:id", userAuth, async (req, res) => {
 
 copyMatrixRouter.put("/copy-matrix/:id", userAuth, async (req, res) => {
 	try {
-		const { status, name } = req.body;
+		const { status, name, uniqueColumn } = req.body;
 		const matrix = await CopyMatrix.findById(req.params.id);
 
 		if (!matrix) {
@@ -1676,6 +1771,16 @@ copyMatrixRouter.put("/copy-matrix/:id", userAuth, async (req, res) => {
 			}
 		}
 
+		if (typeof uniqueColumn === "string" && uniqueColumn.trim()) {
+			if (hasLinkedAssetSources) {
+				return res.status(400).json({
+					message:
+						"Cannot change unique column while synced with an asset source.",
+				});
+			}
+			updates.uniqueColumn = uniqueColumn.trim();
+		}
+
 		if (status) {
 			updates.status = status;
 		}
@@ -1693,6 +1798,7 @@ copyMatrixRouter.put("/copy-matrix/:id", userAuth, async (req, res) => {
 				accountId: updated.accountId,
 				name: updated.name,
 				status: updated.status,
+				uniqueColumn: updated.uniqueColumn || null,
 				updatedAt: updated.updatedAt,
 			},
 		});

@@ -72,6 +72,12 @@ const CopyMatrixSchema = new mongoose.Schema(
 			type: [String],
 			default: [],
 		},
+		/** Preferred unique column for AS creation (e.g. "column1"). */
+		uniqueColumn: {
+			type: String,
+			trim: true,
+			default: null,
+		},
 	},
 	{ timestamps: true }
 );

@@ -25,6 +25,21 @@ const {
 	normalizeRowDataValues,
 	normalizeCellText,
 } = require("../constants/copyMatrix");
+const {
+	fillColumnSequence,
+	copyFromOtherColumn,
+	fillColumnDate,
+	replaceInColumn,
+	applyColumnCellChanges,
+	renameAssetSourceColumn,
+	deleteAssetSourceColumn,
+	cloneAssetSourceColumn,
+	suggestCloneColumnName,
+	reorderAssetSourceColumns,
+	addAssetSourceRow,
+	addAssetSourceColumn,
+	cloneAssetSourceRow,
+} = require("../services/assetSourceColumnOps");
 
 const assetRouter = express.Router();
 
@@ -902,6 +917,354 @@ assetRouter.delete("/source/:id", userAuth, async (req, res) => {
 	} catch (err) {
 		console.error(err);
 		res.status(500).json({ message: "Failed to delete asset source" });
+	}
+});
+
+// =====================================================================
+// COLUMN OPS (parity with Copy Matrix)
+// =====================================================================
+
+async function loadUploadOr404(req, res) {
+	const upload = await AssetUpload.findById(req.params.id);
+	if (!upload) {
+		res.status(404).json({ message: "Asset source not found" });
+		return null;
+	}
+	return upload;
+}
+
+assetRouter.post(
+	"/source/:id/columns/fill-sequence",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const result = await fillColumnSequence(
+				upload,
+				req.body.column,
+				req.body.rowIds,
+				req.user._id
+			);
+			res.status(200).json({
+				message: "Sequence numbers applied",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to fill sequence"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/copy-from",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const { targetColumn, sourceColumn, rowIds } = req.body;
+			const result = await copyFromOtherColumn(
+				upload,
+				targetColumn,
+				sourceColumn,
+				rowIds,
+				req.user._id
+			);
+			res.status(200).json({
+				message: "Column values copied",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to copy from column"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/fill-date",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const { column, dateValue, rowIds } = req.body;
+			const result = await fillColumnDate(
+				upload,
+				column,
+				dateValue,
+				rowIds,
+				req.user._id
+			);
+			res.status(200).json({ message: "Date applied", data: result });
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to fill date"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/replace",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const { column, find, replace, mode, rowIds } = req.body;
+			const result = await replaceInColumn(
+				upload,
+				column,
+				find,
+				replace,
+				mode,
+				rowIds,
+				req.user._id
+			);
+			res.status(200).json({
+				message: result.message || "Replace completed",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to replace"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/apply-changes",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const { column, changes } = req.body;
+			const result = await applyColumnCellChanges(
+				upload,
+				column,
+				changes,
+				req.user._id
+			);
+			res.status(200).json({
+				message: `Applied ${result.updated} change${
+					result.updated === 1 ? "" : "s"
+				}`,
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to apply changes"),
+			});
+		}
+	}
+);
+
+assetRouter.put(
+	"/source/:id/columns/rename",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const { oldName, newName } = req.body;
+			const updated = await renameAssetSourceColumn(
+				upload,
+				oldName,
+				newName,
+				req.user._id
+			);
+			res.status(200).json({
+				message: "Column renamed",
+				data: {
+					columns: updated.columns,
+					uniqueColumn: updated.uniqueColumn,
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to rename column"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/delete",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const updated = await deleteAssetSourceColumn(
+				upload,
+				req.body.column,
+				req.user._id
+			);
+			res.status(200).json({
+				message: "Column deleted",
+				data: { columns: updated.columns },
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to delete column"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/clone",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const { sourceColumn, newColumnName } = req.body;
+			const name =
+				String(newColumnName || "").trim() ||
+				suggestCloneColumnName(sourceColumn, upload.columns || []);
+			const result = await cloneAssetSourceColumn(
+				upload,
+				sourceColumn,
+				name,
+				req.user._id
+			);
+			res.status(200).json({
+				message: "Column cloned",
+				data: {
+					columns: result.upload.columns,
+					newColumnName: result.newColumnName,
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to clone column"),
+			});
+		}
+	}
+);
+
+assetRouter.put(
+	"/source/:id/columns/reorder",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const updated = await reorderAssetSourceColumns(
+				upload,
+				req.body?.columns,
+				req.user._id
+			);
+			res.status(200).json({
+				message: "Column order updated",
+				data: { columns: updated.columns },
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to reorder columns"),
+			});
+		}
+	}
+);
+
+assetRouter.post("/source/:id/rows/add", userAuth, async (req, res) => {
+	try {
+		const upload = await loadUploadOr404(req, res);
+		if (!upload) return;
+		const result = await addAssetSourceRow(
+			upload,
+			req.user._id,
+			req.body?.rowData || {}
+		);
+		const row = result.row;
+		res.status(201).json({
+			message: "Row added successfully",
+			data: {
+				row: {
+					_id: row._id,
+					rowIndex: row.cmRowIndex,
+					primaryKey: row.primaryKey,
+					...(row.rowData || {}),
+				},
+				processedRows: result.upload.processedRows,
+			},
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(err.statusCode || 500).json({
+			message: formatApiError(err, "Failed to add row"),
+		});
+	}
+});
+
+assetRouter.post("/source/:id/columns/add", userAuth, async (req, res) => {
+	try {
+		const upload = await loadUploadOr404(req, res);
+		if (!upload) return;
+		const updated = await addAssetSourceColumn(
+			upload,
+			req.body?.columnName,
+			req.user._id
+		);
+		res.status(201).json({
+			message: "Column added successfully",
+			data: { columns: updated.columns },
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(err.statusCode || 500).json({
+			message: formatApiError(err, "Failed to add column"),
+		});
+	}
+});
+
+assetRouter.post("/source/:id/rows/clone", userAuth, async (req, res) => {
+	try {
+		const upload = await loadUploadOr404(req, res);
+		if (!upload) return;
+		if (!req.body?.sourceRowId) {
+			return res.status(400).json({ message: "Source row is required" });
+		}
+		const result = await cloneAssetSourceRow(
+			upload,
+			req.body.sourceRowId,
+			req.user._id
+		);
+		const row = result.row;
+		res.status(201).json({
+			message: "Row cloned successfully",
+			data: {
+				row: {
+					_id: row._id,
+					rowIndex: row.cmRowIndex,
+					primaryKey: row.primaryKey,
+					...(row.rowData || {}),
+				},
+				processedRows: result.upload.processedRows,
+			},
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(err.statusCode || 500).json({
+			message: formatApiError(err, "Failed to clone row"),
+		});
 	}
 });
 
