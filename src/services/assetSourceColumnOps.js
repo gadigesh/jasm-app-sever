@@ -100,6 +100,8 @@ async function copyFromOtherColumn(
 	upload,
 	targetColumn,
 	sourceColumn,
+	template,
+	splitBy,
 	rowIds,
 	userId
 ) {
@@ -113,26 +115,123 @@ async function copyFromOtherColumn(
 		throw err;
 	}
 
+	const wordPositions = new Map([
+		["First word", 0],
+		["Second word", 1],
+		["Third word", 2],
+		["Fourth word", 3],
+		["Fifth word", 4],
+	]);
+	const separator = String(splitBy ?? "");
+	const format =
+		separator === "" ? "" : normalizeSearchQuery(template);
+	const isValidSeparator =
+		separator === "" ||
+		separator === " " ||
+		(separator.length <= 20 &&
+			/^[^\p{L}\p{N}\s]+$/u.test(separator));
+	if (!isValidSeparator) {
+		const err = new Error("Invalid split option");
+		err.statusCode = 400;
+		throw err;
+	}
+	for (const match of format.matchAll(/\[([^\[\]]+)\]/g)) {
+		if (!wordPositions.has(match[1])) {
+			const err = new Error(`Invalid extract token: [${match[1]}]`);
+			err.statusCode = 400;
+			throw err;
+		}
+	}
+
 	const rows = await loadTargetRows(upload._id, rowIds);
 	if (!rows.length) return { updated: 0 };
 
 	const uniqueColumn = upload.uniqueColumn;
-	const ops = rows.map((row) => ({
-		updateOne: {
-			filter: { _id: row._id },
-			update: {
-				$set: cellSetFields(
-					targetColumn,
-					row.rowData?.[sourceColumn] ?? "",
-					uniqueColumn
-				),
+	const ops = rows.map((row) => {
+		const sourceValue = row.rowData?.[sourceColumn] ?? "";
+		const normalizedSource = normalizeCellText(sourceValue);
+		const words = (
+			separator === " "
+				? normalizedSource.split(/\s+/)
+				: normalizedSource.split(separator)
+		)
+			.map((word) => word.trim())
+			.filter(Boolean);
+		const value = format
+			? normalizeCellText(
+					format.replace(
+						/\[([^\[\]]+)\]/g,
+						(_match, token) => words[wordPositions.get(token)] ?? ""
+					)
+			  )
+			: sourceValue;
+		return {
+			updateOne: {
+				filter: { _id: row._id },
+				update: {
+					$set: cellSetFields(targetColumn, value, uniqueColumn),
+				},
 			},
-		},
-	}));
+		};
+	});
 
 	await AssetSource.bulkWrite(ops);
 	await touchUpload(upload, userId);
 	return { updated: ops.length };
+}
+
+async function generateColumnText(
+	upload,
+	targetColumn,
+	template,
+	rowIds,
+	userId
+) {
+	assertColumnExists(upload, targetColumn);
+	assertEditableDataColumn(targetColumn);
+
+	const customTemplate = normalizeSearchQuery(template);
+	const hasCustomTemplate = normalizeCellText(customTemplate).length > 0;
+	if (!hasCustomTemplate) {
+		const err = new Error("Add a format");
+		err.statusCode = 400;
+		throw err;
+	}
+	for (const match of customTemplate.matchAll(/\[([^\[\]]+)\]/g)) {
+		const sourceColumn = match[1];
+		assertColumnExists(upload, sourceColumn);
+		if (sourceColumn === targetColumn) {
+			const err = new Error("Target column cannot be used as a source");
+			err.statusCode = 400;
+			throw err;
+		}
+	}
+
+	const rows = await loadTargetRows(upload._id, rowIds);
+	if (!rows.length) return { updated: 0 };
+
+	const uniqueColumn = upload.uniqueColumn;
+	const ops = rows.map((row) => {
+		const value = normalizeCellText(
+			customTemplate.replace(
+				/\[([^\[\]]+)\]/g,
+				(_match, column) =>
+					normalizeCellText(row.rowData?.[column])
+			)
+		);
+		return {
+			updateOne: {
+				filter: { _id: row._id },
+				update: {
+					$set: cellSetFields(targetColumn, value, uniqueColumn),
+				},
+			},
+		};
+	});
+
+	await AssetSource.bulkWrite(ops);
+	await touchUpload(upload, userId);
+	return { updated: ops.length, column: targetColumn };
 }
 
 async function fillColumnDate(upload, column, dateValue, rowIds, userId) {
@@ -309,7 +408,18 @@ async function applyColumnCellChanges(upload, column, cellChanges, userId) {
 	return { updated: ops.length, column };
 }
 
+function assertDraftColumnStructure(upload) {
+	if (upload.status !== "draft") {
+		const err = new Error(
+			"Columns cannot be renamed or deleted after the asset source is finalized"
+		);
+		err.statusCode = 400;
+		throw err;
+	}
+}
+
 async function renameAssetSourceColumn(upload, oldName, newName, userId) {
+	assertDraftColumnStructure(upload);
 	assertColumnExists(upload, oldName);
 	assertEditableDataColumn(oldName);
 
@@ -361,6 +471,7 @@ async function renameAssetSourceColumn(upload, oldName, newName, userId) {
 }
 
 async function deleteAssetSourceColumn(upload, column, userId) {
+	assertDraftColumnStructure(upload);
 	assertColumnExists(upload, column);
 	assertEditableDataColumn(column);
 
@@ -592,6 +703,7 @@ async function cloneAssetSourceRow(upload, sourceRowId, userId) {
 module.exports = {
 	fillColumnSequence,
 	copyFromOtherColumn,
+	generateColumnText,
 	fillColumnDate,
 	replaceInColumn,
 	applyColumnCellChanges,

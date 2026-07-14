@@ -28,6 +28,7 @@ const {
 const {
 	fillColumnSequence,
 	copyFromOtherColumn,
+	generateColumnText,
 	fillColumnDate,
 	replaceInColumn,
 	applyColumnCellChanges,
@@ -966,22 +967,57 @@ assetRouter.post(
 		try {
 			const upload = await loadUploadOr404(req, res);
 			if (!upload) return;
-			const { targetColumn, sourceColumn, rowIds } = req.body;
+			const { targetColumn, sourceColumn, template, splitBy, rowIds } =
+				req.body;
 			const result = await copyFromOtherColumn(
 				upload,
 				targetColumn,
 				sourceColumn,
+				template,
+				splitBy,
 				rowIds,
 				req.user._id
 			);
 			res.status(200).json({
-				message: "Column values copied",
+				message: "Column values extracted",
 				data: result,
 			});
 		} catch (err) {
 			console.error(err);
 			res.status(err.statusCode || 500).json({
 				message: formatApiError(err, "Failed to copy from column"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/generate-text",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const {
+				targetColumn,
+				template,
+				rowIds,
+			} = req.body;
+			const result = await generateColumnText(
+				upload,
+				targetColumn,
+				template,
+				rowIds,
+				req.user._id
+			);
+			res.status(200).json({
+				message: "Generated text applied",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to generate text"),
 			});
 		}
 	}

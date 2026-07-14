@@ -108,6 +108,8 @@ async function copyFromOtherColumn(
 	matrix,
 	targetColumn,
 	sourceColumn,
+	template,
+	splitBy,
 	rowIds,
 	userId
 ) {
@@ -121,27 +123,125 @@ async function copyFromOtherColumn(
 		throw err;
 	}
 
+	const wordPositions = new Map([
+		["First word", 0],
+		["Second word", 1],
+		["Third word", 2],
+		["Fourth word", 3],
+		["Fifth word", 4],
+	]);
+	const separator = String(splitBy ?? "");
+	const format =
+		separator === "" ? "" : normalizeSearchQuery(template);
+	const isValidSeparator =
+		separator === "" ||
+		separator === " " ||
+		(separator.length <= 20 &&
+			/^[^\p{L}\p{N}\s]+$/u.test(separator));
+	if (!isValidSeparator) {
+		const err = new Error("Invalid split option");
+		err.statusCode = 400;
+		throw err;
+	}
+	for (const match of format.matchAll(/\[([^\[\]]+)\]/g)) {
+		if (!wordPositions.has(match[1])) {
+			const err = new Error(`Invalid extract token: [${match[1]}]`);
+			err.statusCode = 400;
+			throw err;
+		}
+	}
+
 	const rows = await loadTargetRows(matrix._id, rowIds);
 	if (!rows.length) {
 		return { updated: 0 };
 	}
 
-	const ops = rows.map((row) => ({
-		updateOne: {
-			filter: { _id: row._id },
-			update: {
-				$set: {
-					[`rowData.${targetColumn}`]:
-						row.rowData?.[sourceColumn] ?? "",
+	const ops = rows.map((row) => {
+		const sourceValue = row.rowData?.[sourceColumn] ?? "";
+		const normalizedSource = normalizeCellText(sourceValue);
+		const words = (
+			separator === " "
+				? normalizedSource.split(/\s+/)
+				: normalizedSource.split(separator)
+		)
+			.map((word) => word.trim())
+			.filter(Boolean);
+		const value = format
+			? normalizeCellText(
+					format.replace(
+						/\[([^\[\]]+)\]/g,
+						(_match, token) => words[wordPositions.get(token)] ?? ""
+					)
+			  )
+			: sourceValue;
+		return {
+			updateOne: {
+				filter: { _id: row._id },
+				update: {
+					$set: {
+						[`rowData.${targetColumn}`]: value,
+					},
 				},
 			},
-		},
-	}));
+		};
+	});
 
 	await CopyMatrixRow.bulkWrite(ops);
 	matrix.updatedBy = userId;
 	await matrix.save();
 	return { updated: ops.length };
+}
+
+async function generateColumnText(
+	matrix,
+	targetColumn,
+	template,
+	rowIds,
+	userId
+) {
+	assertColumnExists(matrix, targetColumn);
+	assertEditableDataColumn(targetColumn);
+
+	const customTemplate = normalizeSearchQuery(template);
+	const hasCustomTemplate = normalizeCellText(customTemplate).length > 0;
+	if (!hasCustomTemplate) {
+		const err = new Error("Add a format");
+		err.statusCode = 400;
+		throw err;
+	}
+	for (const match of customTemplate.matchAll(/\[([^\[\]]+)\]/g)) {
+		const sourceColumn = match[1];
+		assertColumnExists(matrix, sourceColumn);
+		if (sourceColumn === targetColumn) {
+			const err = new Error("Target column cannot be used as a source");
+			err.statusCode = 400;
+			throw err;
+		}
+	}
+
+	const rows = await loadTargetRows(matrix._id, rowIds);
+	if (!rows.length) return { updated: 0 };
+
+	const ops = rows.map((row) => {
+		const value = normalizeCellText(
+			customTemplate.replace(
+				/\[([^\[\]]+)\]/g,
+				(_match, column) =>
+					normalizeCellText(row.rowData?.[column])
+			)
+		);
+		return {
+			updateOne: {
+				filter: { _id: row._id },
+				update: { $set: { [`rowData.${targetColumn}`]: value } },
+			},
+		};
+	});
+
+	await CopyMatrixRow.bulkWrite(ops);
+	matrix.updatedBy = userId;
+	await matrix.save();
+	return { updated: ops.length, column: targetColumn };
 }
 
 async function fillColumnDate(
@@ -430,6 +530,7 @@ function suggestCloneColumnName(sourceColumn, columns = []) {
 module.exports = {
 	fillColumnSequence,
 	copyFromOtherColumn,
+	generateColumnText,
 	fillColumnDate,
 	replaceInColumn,
 	applyColumnCellChanges,
