@@ -442,6 +442,7 @@ async function listAccountAssets(
 ) {
 	const advId = await resolveAccountAdvId(accountId);
 	const assets = [];
+	const folders = [];
 	const visited = new Set();
 	const folderPrefix = String(folder || "")
 		.trim()
@@ -473,6 +474,10 @@ async function listAccountAssets(
 					if (!folderName) continue;
 					if (excludeAem && isAemFolderName(folderName)) continue;
 					const childPrefix = joinFolderPrefix(prefix, folderName);
+					const childPath = childPrefix.replace(/\/+$/, "");
+					if (childPath && !folders.includes(childPath)) {
+						folders.push(childPath);
+					}
 					if (excludeAem && isAemFolderName(childPrefix.split("/")[0])) {
 						continue;
 					}
@@ -490,6 +495,9 @@ async function listAccountAssets(
 		accountAdvId: advId,
 		folder: folderPrefix,
 		assets,
+		folders: folders.sort((left, right) =>
+			left.localeCompare(right, undefined, { sensitivity: "base" })
+		),
 	};
 }
 
@@ -663,6 +671,7 @@ module.exports = {
 	matchAssetUrl,
 	resolveAccountAdvId,
 	pickAssetUrl,
+	pickAssetName,
 	pickFirstUploadedCdnUrl,
 	resolveUploadedCdnUrl,
 };
