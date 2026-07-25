@@ -22,12 +22,15 @@ const {
 } = require("../utils/nameValidation");
 const { formatApiError } = require("../utils/apiErrors");
 const {
+	AUTO_ROW_ID_COLUMN,
+	isAutoRowIdColumn,
 	normalizeRowDataValues,
 	normalizeCellText,
 } = require("../constants/copyMatrix");
 const {
 	fillColumnSequence,
 	copyFromOtherColumn,
+	deleteAssetSourceRow,
 	generateColumnText,
 	fillColumnDate,
 	replaceInColumn,
@@ -40,9 +43,110 @@ const {
 	addAssetSourceRow,
 	addAssetSourceColumn,
 	cloneAssetSourceRow,
+	updateColumnImages,
+	fillColumnWithCdnUrl,
 } = require("../services/assetSourceColumnOps");
+const {
+	uploadAssetsToAccount,
+	listAccountFolders,
+	resolveUploadedCdnUrl,
+} = require("../services/mindshareAssetLibrary");
 
 const assetRouter = express.Router();
+
+async function analyzeAssetSourceUniqueness(
+	uploadId,
+	keyColumn,
+	rowUpdates = []
+) {
+	if (isAutoRowIdColumn(keyColumn)) {
+		return {
+			unique: true,
+			column: keyColumn,
+			duplicates: [],
+			emptyRowIndexes: [],
+			emptyRowIds: [],
+			message: null,
+		};
+	}
+
+	const rows = await AssetSource.find({
+		uploadId,
+		isDeleted: false,
+	})
+		.select("_id rowData cmRowIndex")
+		.sort({ cmRowIndex: 1, primaryKey: 1 })
+		.lean();
+	const updatesById = new Map(
+		(Array.isArray(rowUpdates) ? rowUpdates : [])
+			.filter((item) => item?._id && item?.rowData)
+			.map((item) => [String(item._id), item.rowData])
+	);
+	const byValue = new Map();
+	const emptyRows = [];
+
+	rows.forEach((row, index) => {
+		const rowData = {
+			...(row.rowData || {}),
+			...(updatesById.get(String(row._id)) || {}),
+		};
+		const value = normalizeCellText(rowData[keyColumn]);
+		const rowIndex = row.cmRowIndex ?? index + 1;
+		const entry = { rowId: String(row._id), rowIndex };
+		if (!value) {
+			emptyRows.push(entry);
+			return;
+		}
+		if (!byValue.has(value)) byValue.set(value, []);
+		byValue.get(value).push(entry);
+	});
+
+	const duplicates = Array.from(byValue.entries())
+		.filter(([, matchingRows]) => matchingRows.length > 1)
+		.map(([value, matchingRows]) => ({
+			value,
+			count: matchingRows.length,
+			rowIndexes: matchingRows.map((row) => row.rowIndex),
+			rowIds: matchingRows.map((row) => row.rowId),
+		}));
+	const emptyRowIndexes = emptyRows.map((row) => row.rowIndex);
+	const emptyRowIds = emptyRows.map((row) => row.rowId);
+	const unique = duplicates.length === 0 && emptyRows.length === 0;
+	let message = null;
+
+	if (duplicates.length > 0) {
+		const samples = duplicates
+			.slice(0, 3)
+			.map(
+				(item) =>
+					`"${item.value}" (rows ${item.rowIndexes.join(", ")})`
+			)
+			.join("; ");
+		message = `Duplicate values in "${keyColumn}": ${samples}${
+			duplicates.length > 3
+				? ` and ${duplicates.length - 3} more`
+				: ""
+		}`;
+		if (emptyRows.length > 0) {
+			message += `. Also ${emptyRows.length} empty cell${
+				emptyRows.length === 1 ? "" : "s"
+			}`;
+		}
+	} else if (emptyRows.length > 0) {
+		message = `${emptyRows.length} empty cell${
+			emptyRows.length === 1 ? "" : "s"
+		} in "${keyColumn}". Fill every value before saving`;
+	}
+
+	return {
+		unique,
+		column: keyColumn,
+		duplicates,
+		emptyRowIndexes,
+		emptyRowIds,
+		message,
+	};
+}
 
 // Multer Config (Temp Storage)
 const upload = multer({
@@ -66,6 +170,108 @@ function collectMatrixIdsForAsset(asset) {
 	}
 	return [...ids];
 }
+
+// Latest unfinished draft for an account (Back/Cancel save-as-draft resume).
+assetRouter.get("/source/draft/:accountId", userAuth, async (req, res) => {
+	try {
+		const { accountId } = req.params;
+		const draft = await AssetUpload.findOne({
+			accountId,
+			$or: [{ status: "draft" }, { hasEditDraft: true }],
+		})
+			.select("_id assetName name fileName status hasEditDraft updatedAt")
+			.sort({ updatedAt: -1 })
+			.lean();
+
+		res.status(200).json({
+			message: draft ? "Draft found" : "No draft",
+			data: draft
+				? {
+						_id: String(draft._id),
+						name:
+							draft.assetName ||
+							draft.name ||
+							draft.fileName?.replace(/\.[^.]+$/, "") ||
+							"Untitled",
+						status: draft.status,
+						hasEditDraft: Boolean(draft.hasEditDraft),
+						updatedAt: draft.updatedAt,
+				  }
+				: null,
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({
+			message: err.message || "Failed to fetch draft",
+		});
+	}
+});
+
+assetRouter.post("/source/:id/save-draft", userAuth, async (req, res) => {
+	try {
+		const upload = await AssetUpload.findById(req.params.id);
+		if (!upload) {
+			return res.status(404).json({ message: "Asset source not found" });
+		}
+
+		if (upload.status !== "draft") {
+			upload.hasEditDraft = true;
+		}
+		upload.uploadedBy = req.user._id;
+		await upload.save();
+
+		res.status(200).json({
+			message: "Saved as draft",
+			data: {
+				_id: String(upload._id),
+				name: upload.assetName,
+				status: upload.status,
+				hasEditDraft: Boolean(upload.hasEditDraft),
+			},
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({
+			message: err.message || "Failed to save draft",
+		});
+	}
+});
+
+assetRouter.post("/source/:id/discard-draft", userAuth, async (req, res) => {
+	try {
+		const upload = await AssetUpload.findById(req.params.id);
+		if (!upload) {
+			return res.status(404).json({ message: "Asset source not found" });
+		}
+
+		if (upload.status === "draft") {
+			await AssetSource.deleteMany({ uploadId: upload._id });
+			await upload.deleteOne();
+			return res.status(200).json({
+				message: "Draft discarded",
+				data: { deleted: true },
+			});
+		}
+
+		upload.hasEditDraft = false;
+		upload.uploadedBy = req.user._id;
+		await upload.save();
+
+		res.status(200).json({
+			message: "Draft discarded",
+			data: {
+				deleted: false,
+				_id: String(upload._id),
+				status: upload.status,
+			},
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({
+			message: err.message || "Failed to discard draft",
+		});
+	}
+});
 
 // =====================================================================
 // ROUTE 1: GET ASSET LIST
@@ -517,9 +723,7 @@ assetRouter.get("/source/:id/export", userAuth, async (req, res) => {
 			return res.status(404).json({ message: "Asset source not found" });
 		}
 
-		const sortOrder = upload.copyMatrixId
-			? { cmRowIndex: 1, primaryKey: 1 }
-			: { primaryKey: 1 };
+		const sortOrder = { cmRowIndex: 1, primaryKey: 1 };
 
 		const rows = await AssetSource.find({
 			uploadId: upload._id,
@@ -574,10 +778,14 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 				  );
 
 		let deletedAssetSourceNames = [];
+		let syncedColumns = [];
 		if (upload.copyMatrixId) {
 			const linkedMatrix = await CopyMatrix.findById(
 				upload.copyMatrixId
-			).select("deletedAssetSourceNames lastDeletedAssetSourceName");
+			).select(
+				"columns deletedAssetSourceNames lastDeletedAssetSourceName"
+			);
+			syncedColumns = linkedMatrix?.columns || [];
 			deletedAssetSourceNames = getDeletedAssetSourceNames(linkedMatrix);
 		}
 
@@ -593,6 +801,7 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 				columns,
 				processedRows: upload.processedRows,
 				copyMatrixId: upload.copyMatrixId,
+				syncedColumns,
 				deletedAssetSourceNames,
 				lastDeletedAssetSourceName:
 					deletedAssetSourceNames[deletedAssetSourceNames.length - 1] ||
@@ -629,9 +838,7 @@ assetRouter.get("/source/:id/rows", userAuth, async (req, res) => {
 
 		const filter = { uploadId: upload._id, isDeleted: false };
 
-		const sortOrder = upload.copyMatrixId
-			? { cmRowIndex: 1, primaryKey: 1 }
-			: { primaryKey: 1 };
+		const sortOrder = { cmRowIndex: 1, primaryKey: 1 };
 
 		const [rows, total] = await Promise.all([
 			AssetSource.find(filter).sort(sortOrder).skip(skip).limit(limit).lean(),
@@ -673,6 +880,42 @@ assetRouter.get("/source/:id/rows", userAuth, async (req, res) => {
 // ROUTE 6: UPDATE ASSET SOURCE ROWS (bulk edit in preview)
 // URL: PUT /source/:id/rows
 // =====================================================================
+assetRouter.post(
+	"/source/:id/check-unique-column",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await AssetUpload.findById(req.params.id);
+			if (!upload) {
+				return res.status(404).json({ message: "Asset source not found" });
+			}
+			const column =
+				req.body?.column?.trim() ||
+				upload.uniqueColumn ||
+				AUTO_ROW_ID_COLUMN;
+			const analysis = await analyzeAssetSourceUniqueness(
+				upload._id,
+				column,
+				req.body?.rows
+			);
+			res.status(200).json({
+				message: analysis.unique
+					? "Column is unique"
+					: analysis.message,
+				data: analysis,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(500).json({
+				message: formatApiError(
+					err,
+					"Failed to check unique column"
+				),
+			});
+		}
+	}
+);
+
 assetRouter.put("/source/:id/rows", userAuth, async (req, res) => {
 	try {
 		const { rows } = req.body;
@@ -686,6 +929,18 @@ assetRouter.put("/source/:id/rows", userAuth, async (req, res) => {
 		}
 
 		const keyColumn = upload.uniqueColumn;
+		const uniqueness = await analyzeAssetSourceUniqueness(
+			upload._id,
+			keyColumn || AUTO_ROW_ID_COLUMN,
+			rows
+		);
+		if (!uniqueness.unique) {
+			return res.status(409).json({
+				message: uniqueness.message,
+				code: "UNIQUE_COLUMN_INVALID",
+				data: uniqueness,
+			});
+		}
 
 		for (const item of rows) {
 			if (!item._id || !item.rowData) continue;
@@ -693,13 +948,24 @@ assetRouter.put("/source/:id/rows", userAuth, async (req, res) => {
 			const asset = await AssetSource.findById(item._id);
 			if (!asset || String(asset.uploadId) !== String(upload._id)) continue;
 
-			asset.rowData = normalizeRowDataValues(item.rowData);
-			if (item.rowData[keyColumn] != null) {
-				asset.primaryKey = normalizeCellText(
-					item.rowData[keyColumn]
+			const normalizedRowData = normalizeRowDataValues(item.rowData);
+			await updateAssetWithHistory(
+				asset._id,
+				normalizedRowData,
+				req.user._id
+			);
+			if (normalizedRowData[keyColumn] != null) {
+				await AssetSource.updateOne(
+					{ _id: asset._id },
+					{
+						$set: {
+							primaryKey: normalizeCellText(
+								normalizedRowData[keyColumn]
+							),
+						},
+					}
 				);
 			}
-			await asset.save();
 		}
 
 		upload.uploadedBy = req.user._id;
@@ -734,6 +1000,17 @@ assetRouter.post("/source/:id/finish", userAuth, async (req, res) => {
 				.status(400)
 				.json({ message: "Only draft asset sources can be finalized" });
 		}
+		const uniqueness = await analyzeAssetSourceUniqueness(
+			upload._id,
+			upload.uniqueColumn || AUTO_ROW_ID_COLUMN
+		);
+		if (!uniqueness.unique) {
+			return res.status(409).json({
+				message: uniqueness.message,
+				code: "UNIQUE_COLUMN_INVALID",
+				data: uniqueness,
+			});
+		}
 
 		if (assetName?.trim()) {
 			const trimmedName = assetName.trim();
@@ -757,6 +1034,7 @@ assetRouter.post("/source/:id/finish", userAuth, async (req, res) => {
 			);
 		}
 		upload.status = "completed";
+		upload.hasEditDraft = false;
 		upload.message = `Asset source saved — ${upload.processedRows} rows`;
 		upload.uploadedBy = req.user._id;
 		await upload.save();
@@ -991,6 +1269,28 @@ assetRouter.post(
 	}
 );
 
+assetRouter.delete(
+	"/source/:id/rows/:rowId",
+	userAuth,
+	async (req, res) => {
+		try {
+			const upload = await loadUploadOr404(req, res);
+			if (!upload) return;
+			const result = await deleteAssetSourceRow(
+				upload,
+				req.params.rowId,
+				req.user._id
+			);
+			res.status(200).json({ message: "Row deleted", data: result });
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to delete row"),
+			});
+		}
+	}
+);
+
 assetRouter.post(
 	"/source/:id/columns/generate-text",
 	userAuth,
@@ -1018,6 +1318,197 @@ assetRouter.post(
 			console.error(err);
 			res.status(err.statusCode || 500).json({
 				message: formatApiError(err, "Failed to generate text"),
+			});
+		}
+	}
+);
+
+assetRouter.get(
+	"/source/:id/columns/update-images/folders",
+	userAuth,
+	async (req, res) => {
+		try {
+			const asset = await loadUploadOr404(req, res);
+			if (!asset) return;
+			const result = await listAccountFolders(asset.accountId);
+			res.status(200).json({
+				message: "Folders fetched",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to list folders"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/update-images/upload",
+	userAuth,
+	upload.array("files", 50),
+	async (req, res) => {
+		const tempFiles = Array.isArray(req.files) ? req.files : [];
+		try {
+			const asset = await loadUploadOr404(req, res);
+			if (!asset) return;
+
+			const result = await uploadAssetsToAccount(
+				asset.accountId,
+				tempFiles
+			);
+
+			const folder = String(
+				req.body?.folder || req.query?.folder || ""
+			).trim();
+			const targetColumn = String(
+				req.body?.targetColumn || req.query?.targetColumn || ""
+			).trim();
+			let rowIds = req.body?.rowIds ?? req.query?.rowIds;
+			if (typeof rowIds === "string") {
+				try {
+					rowIds = JSON.parse(rowIds);
+				} catch {
+					rowIds = rowIds ? [rowIds] : [];
+				}
+			}
+			if (!Array.isArray(rowIds)) rowIds = [];
+
+			const cdnUrl = await resolveUploadedCdnUrl(
+				asset.accountId,
+				result,
+				tempFiles,
+				folder
+			);
+
+			let applied = null;
+			if (cdnUrl && targetColumn && rowIds.length > 0) {
+				applied = await fillColumnWithCdnUrl(
+					asset,
+					targetColumn,
+					rowIds,
+					cdnUrl,
+					req.user._id
+				);
+			}
+
+			res.status(200).json({
+				message: applied?.updated
+					? `Uploaded and set CDN URL on ${applied.updated} selected row${
+							applied.updated === 1 ? "" : "s"
+					  }`
+					: cdnUrl
+					? `Uploaded ${result.uploaded} file${
+							result.uploaded === 1 ? "" : "s"
+					  } to asset library`
+					: `Uploaded ${result.uploaded} file${
+							result.uploaded === 1 ? "" : "s"
+					  } to asset library, but CDN URL was not found yet`,
+				data: {
+					...result,
+					cdnUrl: cdnUrl || null,
+					applied,
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to upload images"),
+			});
+		} finally {
+			for (const file of tempFiles) {
+				if (file?.path) {
+					fs.promises.unlink(file.path).catch(() => {});
+				}
+			}
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/update-images/set-cdn",
+	userAuth,
+	async (req, res) => {
+		try {
+			const asset = await loadUploadOr404(req, res);
+			if (!asset) return;
+
+			const targetColumn = String(req.body?.targetColumn || "").trim();
+			const cdnUrl = String(req.body?.cdnUrl || "").trim();
+			let rowIds = req.body?.rowIds;
+			if (typeof rowIds === "string") {
+				try {
+					rowIds = JSON.parse(rowIds);
+				} catch {
+					rowIds = rowIds ? [rowIds] : [];
+				}
+			}
+			if (!Array.isArray(rowIds)) rowIds = [];
+
+			const applied = await fillColumnWithCdnUrl(
+				asset,
+				targetColumn,
+				rowIds,
+				cdnUrl,
+				req.user._id
+			);
+
+			res.status(200).json({
+				message: `Set CDN URL on ${applied.updated} selected row${
+					applied.updated === 1 ? "" : "s"
+				}`,
+				data: applied,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to set CDN URL"),
+			});
+		}
+	}
+);
+
+assetRouter.post(
+	"/source/:id/columns/update-images/apply",
+	userAuth,
+	async (req, res) => {
+		try {
+			const asset = await loadUploadOr404(req, res);
+			if (!asset) return;
+			const {
+				targetColumn,
+				prefixColumn,
+				template,
+				folder,
+				rowIds,
+				dryRun,
+				rowSnapshots,
+			} = req.body;
+			const result = await updateColumnImages(
+				asset,
+				targetColumn,
+				prefixColumn,
+				rowIds,
+				req.user._id,
+				template,
+				folder,
+				{ dryRun, rowSnapshots }
+			);
+			res.status(200).json({
+				message: result.dryRun
+					? `Matched ${result.updated} image URL${
+							result.updated === 1 ? "" : "s"
+					  }`
+					: `Updated ${result.updated} row${
+							result.updated === 1 ? "" : "s"
+					  } with image URLs`,
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to apply images"),
 			});
 		}
 	}

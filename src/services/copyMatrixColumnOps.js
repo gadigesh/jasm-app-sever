@@ -9,6 +9,10 @@ const {
 const {
 	resolveLinkedAssetUpload,
 } = require("./copyMatrixToAssetSource");
+const {
+	buildUpdateImagesAssetIndex,
+	resolveAssetUrlWithFallback,
+} = require("./mindshareAssetLibrary");
 
 /**
  * Prepare find/replace query text.
@@ -43,11 +47,11 @@ function assertEditableDataColumn(column) {
 	}
 }
 
-async function assertNotSyncedForStructureChange(matrix) {
+async function assertColumnNotSynced(matrix, column) {
 	const linked = await resolveLinkedAssetUpload(matrix);
-	if (linked) {
+	if ((linked?.columns || []).includes(column)) {
 		const err = new Error(
-			"Rename and delete are only allowed when the copy matrix is not synced with an asset source"
+			`"${column}" cannot be renamed or deleted because it is synced with an asset source`
 		);
 		err.statusCode = 400;
 		throw err;
@@ -192,6 +196,21 @@ async function copyFromOtherColumn(
 	return { updated: ops.length };
 }
 
+async function deleteCopyMatrixRow(matrix, rowId, userId) {
+	const result = await CopyMatrixRow.deleteOne({
+		_id: rowId,
+		copyMatrixId: matrix._id,
+	});
+	if (!result.deletedCount) {
+		const err = new Error("Copy matrix row not found");
+		err.statusCode = 404;
+		throw err;
+	}
+	matrix.updatedBy = userId;
+	await matrix.save();
+	return { deleted: 1 };
+}
+
 async function generateColumnText(
 	matrix,
 	targetColumn,
@@ -210,24 +229,22 @@ async function generateColumnText(
 		throw err;
 	}
 	for (const match of customTemplate.matchAll(/\[([^\[\]]+)\]/g)) {
-		const sourceColumn = match[1];
+		const sourceColumn = match[1].trim();
+		if (sourceColumn.toUpperCase() === "SN") continue;
 		assertColumnExists(matrix, sourceColumn);
-		if (sourceColumn === targetColumn) {
-			const err = new Error("Target column cannot be used as a source");
-			err.statusCode = 400;
-			throw err;
-		}
 	}
 
 	const rows = await loadTargetRows(matrix._id, rowIds);
 	if (!rows.length) return { updated: 0 };
 
-	const ops = rows.map((row) => {
+	const ops = rows.map((row, index) => {
 		const value = normalizeCellText(
 			customTemplate.replace(
-				/\[([^\[\]]+)\]/g,
+				/\[([^\[\]}]+)(?:\]|\})/g,
 				(_match, column) =>
-					normalizeCellText(row.rowData?.[column])
+					column.trim().toUpperCase() === "SN"
+						? String(index + 1)
+						: normalizeCellText(row.rowData?.[column.trim()])
 			)
 		);
 		return {
@@ -444,7 +461,7 @@ async function applyColumnCellChanges(matrix, column, cellChanges, userId) {
 }
 
 async function renameCopyMatrixColumn(matrix, oldName, newName, userId) {
-	await assertNotSyncedForStructureChange(matrix);
+	await assertColumnNotSynced(matrix, oldName);
 	assertColumnExists(matrix, oldName);
 	assertEditableDataColumn(oldName);
 
@@ -498,7 +515,7 @@ async function renameCopyMatrixColumn(matrix, oldName, newName, userId) {
 }
 
 async function deleteCopyMatrixColumn(matrix, column, userId) {
-	await assertNotSyncedForStructureChange(matrix);
+	await assertColumnNotSynced(matrix, column);
 	assertColumnExists(matrix, column);
 	assertEditableDataColumn(column);
 
@@ -527,15 +544,208 @@ function suggestCloneColumnName(sourceColumn, columns = []) {
 	return `${sourceColumn} (Copy ${i})`;
 }
 
+async function updateColumnImages(
+	matrix,
+	targetColumn,
+	prefixColumn,
+	rowIds,
+	userId,
+	template,
+	folder,
+	options = {}
+) {
+	const dryRun = Boolean(options.dryRun);
+	const rowSnapshots = Array.isArray(options.rowSnapshots)
+		? options.rowSnapshots
+		: null;
+
+	assertColumnExists(matrix, targetColumn);
+	assertEditableDataColumn(targetColumn);
+
+	const customTemplate = normalizeSearchQuery(
+		template ||
+			(prefixColumn ? `[${String(prefixColumn).trim()}]` : "")
+	);
+	if (!normalizeCellText(customTemplate)) {
+		const err = new Error("Add a format");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	for (const match of customTemplate.matchAll(/\[([^\[\]]+)\]/g)) {
+		const sourceColumn = match[1].trim();
+		if (sourceColumn.toUpperCase() === "SN") continue;
+		assertColumnExists(matrix, sourceColumn);
+	}
+
+	let rows;
+	if (rowSnapshots?.length) {
+		rows = rowSnapshots.map((r, i) => ({
+			_id: r._id || r.rowId,
+			rowIndex: r.rowIndex ?? i + 1,
+			rowData:
+				r.rowData && typeof r.rowData === "object" ? r.rowData : {},
+		}));
+	} else {
+		rows = await loadTargetRows(matrix._id, rowIds);
+	}
+
+	if (!rows.length) {
+		return {
+			updated: 0,
+			matched: 0,
+			missing: 0,
+			column: targetColumn,
+			updates: [],
+		};
+	}
+
+	const folderPath = String(folder || "").trim();
+	const {
+		index,
+		librarySize,
+		folder: resolvedFolder,
+		scope,
+	} = await buildUpdateImagesAssetIndex(matrix.accountId, folderPath);
+
+	let matched = 0;
+	let missing = 0;
+	const ops = [];
+	const updates = [];
+	const urlCache = new Map();
+
+	for (let indexInSelection = 0; indexInSelection < rows.length; indexInSelection += 1) {
+		const row = rows[indexInSelection];
+		const assetName = normalizeCellText(
+			customTemplate.replace(
+				/\[([^\[\]]+)\]/g,
+				(_match, column) =>
+					column.trim().toUpperCase() === "SN"
+						? String(indexInSelection + 1)
+						: normalizeCellText(row.rowData?.[column.trim()])
+			)
+		);
+		if (!assetName) {
+			missing += 1;
+			continue;
+		}
+
+		let url = urlCache.get(assetName);
+		if (url === undefined) {
+			url = await resolveAssetUrlWithFallback(
+				matrix.accountId,
+				index,
+				assetName
+			);
+			urlCache.set(assetName, url || "");
+		}
+		if (!url) {
+			missing += 1;
+			continue;
+		}
+
+		matched += 1;
+		updates.push({
+			rowId: String(row._id),
+			url,
+		});
+		if (!dryRun) {
+			ops.push({
+				updateOne: {
+					filter: { _id: row._id },
+					update: { $set: { [`rowData.${targetColumn}`]: url } },
+				},
+			});
+		}
+	}
+
+	if (!dryRun && ops.length) {
+		await CopyMatrixRow.bulkWrite(ops);
+		matrix.updatedBy = userId;
+		await matrix.save();
+	}
+
+	return {
+		updated: dryRun ? updates.length : ops.length,
+		matched,
+		missing,
+		librarySize,
+		folder: resolvedFolder,
+		scope,
+		column: targetColumn,
+		updates,
+		dryRun,
+	};
+}
+
+/** Write one CDN URL into targetColumn for the given rows (selection upload). */
+async function fillColumnWithCdnUrl(
+	matrix,
+	targetColumn,
+	rowIds,
+	cdnUrl,
+	userId
+) {
+	assertColumnExists(matrix, targetColumn);
+	assertEditableDataColumn(targetColumn);
+
+	const url = String(cdnUrl || "").trim();
+	if (!url) {
+		const err = new Error("Uploaded image CDN URL was not returned");
+		err.statusCode = 502;
+		throw err;
+	}
+	if (!Array.isArray(rowIds) || rowIds.length === 0) {
+		const err = new Error("Select at least one row");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	const rows = await loadTargetRows(matrix._id, rowIds);
+	if (!rows.length) {
+		const err = new Error("Selected rows were not found");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	const ops = rows.map((row) => {
+		const nextRowData = {
+			...(row.rowData && typeof row.rowData === "object"
+				? row.rowData
+				: {}),
+			[targetColumn]: url,
+		};
+		return {
+			updateOne: {
+				filter: { _id: row._id },
+				update: { $set: { rowData: nextRowData } },
+			},
+		};
+	});
+
+	await CopyMatrixRow.bulkWrite(ops);
+	matrix.updatedBy = userId;
+	await matrix.save();
+
+	return {
+		updated: ops.length,
+		column: targetColumn,
+		cdnUrl: url,
+	};
+}
+
 module.exports = {
 	fillColumnSequence,
 	copyFromOtherColumn,
+	deleteCopyMatrixRow,
 	generateColumnText,
 	fillColumnDate,
 	replaceInColumn,
 	applyColumnCellChanges,
 	renameCopyMatrixColumn,
 	deleteCopyMatrixColumn,
+	updateColumnImages,
+	fillColumnWithCdnUrl,
 	suggestCloneColumnName,
-	assertNotSyncedForStructureChange,
+	assertColumnNotSynced,
 };

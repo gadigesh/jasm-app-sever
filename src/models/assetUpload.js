@@ -88,6 +88,12 @@ const AssetUploadSchema = new mongoose.Schema(
 			type: mongoose.Schema.Types.ObjectId,
 			ref: "User",
 		},
+		/** True after Back/Cancel from a completed edit — resume prompt on next Edit. */
+		hasEditDraft: {
+			type: Boolean,
+			default: false,
+			index: true,
+		},
 	},
 	{ timestamps: true }
 );

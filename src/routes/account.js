@@ -2,6 +2,8 @@ const express = require("express");
 const accountRouter = express.Router();
 const Account = require("../models/account");
 const { userAuth } = require("../middlewares/auth");
+const { listAccountFolders } = require("../services/mindshareAssetLibrary");
+const { formatApiError } = require("../utils/apiErrors");
 
 const normalize = (value) => value.trim().toLowerCase();
 
@@ -108,5 +110,31 @@ accountRouter.get("/accounts", userAuth, async (req, res) => {
 		});
 	}
 });
+
+// Mindshare folders are account-scoped (same list for all CM/AS under an account).
+accountRouter.get(
+	"/accounts/:accountId/mindshare/folders",
+	userAuth,
+	async (req, res) => {
+		try {
+			const account = await Account.findById(req.params.accountId)
+				.select("_id")
+				.lean();
+			if (!account) {
+				return res.status(404).json({ message: "Account not found" });
+			}
+			const result = await listAccountFolders(account._id);
+			res.status(200).json({
+				message: "Folders fetched",
+				data: result,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(err, "Failed to list folders"),
+			});
+		}
+	}
+);
 
 module.exports = accountRouter;

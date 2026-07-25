@@ -1,10 +1,15 @@
 const mongoose = require("mongoose");
 const AssetSource = require("../models/assetSource");
+const CopyMatrix = require("../models/copyMatrix");
 const {
 	AUTO_ROW_ID_COLUMN,
 	isAutoRowIdColumn,
 	normalizeCellText,
 } = require("../constants/copyMatrix");
+const {
+	buildUpdateImagesAssetIndex,
+	resolveAssetUrlWithFallback,
+} = require("./mindshareAssetLibrary");
 
 function normalizeSearchQuery(value) {
 	if (value == null) return "";
@@ -19,6 +24,20 @@ function assertColumnExists(upload, column) {
 	const columns = upload.columns || [];
 	if (!column || !columns.includes(column)) {
 		const err = new Error("Column not found");
+		err.statusCode = 400;
+		throw err;
+	}
+}
+
+async function assertColumnNotSynced(upload, column) {
+	if (!upload.copyMatrixId) return;
+	const matrix = await CopyMatrix.findById(upload.copyMatrixId)
+		.select("columns")
+		.lean();
+	if ((matrix?.columns || []).includes(column)) {
+		const err = new Error(
+			`"${column}" cannot be renamed or deleted because it is synced with a copy matrix`
+		);
 		err.statusCode = 400;
 		throw err;
 	}
@@ -180,6 +199,20 @@ async function copyFromOtherColumn(
 	return { updated: ops.length };
 }
 
+async function deleteAssetSourceRow(upload, rowId, userId) {
+	const result = await AssetSource.deleteOne({
+		_id: rowId,
+		uploadId: upload._id,
+	});
+	if (!result.deletedCount) {
+		const err = new Error("Asset source row not found");
+		err.statusCode = 404;
+		throw err;
+	}
+	await touchUpload(upload, userId);
+	return { deleted: 1 };
+}
+
 async function generateColumnText(
 	upload,
 	targetColumn,
@@ -198,25 +231,23 @@ async function generateColumnText(
 		throw err;
 	}
 	for (const match of customTemplate.matchAll(/\[([^\[\]]+)\]/g)) {
-		const sourceColumn = match[1];
+		const sourceColumn = match[1].trim();
+		if (sourceColumn.toUpperCase() === "SN") continue;
 		assertColumnExists(upload, sourceColumn);
-		if (sourceColumn === targetColumn) {
-			const err = new Error("Target column cannot be used as a source");
-			err.statusCode = 400;
-			throw err;
-		}
 	}
 
 	const rows = await loadTargetRows(upload._id, rowIds);
 	if (!rows.length) return { updated: 0 };
 
 	const uniqueColumn = upload.uniqueColumn;
-	const ops = rows.map((row) => {
+	const ops = rows.map((row, index) => {
 		const value = normalizeCellText(
 			customTemplate.replace(
-				/\[([^\[\]]+)\]/g,
+				/\[([^\[\]}]+)(?:\]|\})/g,
 				(_match, column) =>
-					normalizeCellText(row.rowData?.[column])
+					column.trim().toUpperCase() === "SN"
+						? String(index + 1)
+						: normalizeCellText(row.rowData?.[column.trim()])
 			)
 		);
 		return {
@@ -408,18 +439,8 @@ async function applyColumnCellChanges(upload, column, cellChanges, userId) {
 	return { updated: ops.length, column };
 }
 
-function assertDraftColumnStructure(upload) {
-	if (upload.status !== "draft") {
-		const err = new Error(
-			"Columns cannot be renamed or deleted after the asset source is finalized"
-		);
-		err.statusCode = 400;
-		throw err;
-	}
-}
-
 async function renameAssetSourceColumn(upload, oldName, newName, userId) {
-	assertDraftColumnStructure(upload);
+	await assertColumnNotSynced(upload, oldName);
 	assertColumnExists(upload, oldName);
 	assertEditableDataColumn(oldName);
 
@@ -471,7 +492,7 @@ async function renameAssetSourceColumn(upload, oldName, newName, userId) {
 }
 
 async function deleteAssetSourceColumn(upload, column, userId) {
-	assertDraftColumnStructure(upload);
+	await assertColumnNotSynced(upload, column);
 	assertColumnExists(upload, column);
 	assertEditableDataColumn(column);
 
@@ -665,21 +686,98 @@ async function cloneAssetSourceRow(upload, sourceRowId, userId) {
 		throw err;
 	}
 
-	const maxRow = await AssetSource.findOne({ uploadId: upload._id })
+	let sourceIndex = source.cmRowIndex;
+	if (sourceIndex == null) {
+		const orderedRows = await AssetSource.find({
+			uploadId: upload._id,
+			isDeleted: false,
+		})
+			.sort({ primaryKey: 1 })
+			.select("_id")
+			.lean();
+		if (orderedRows.length) {
+			await AssetSource.bulkWrite(
+				orderedRows.map((existing, index) => ({
+					updateOne: {
+						filter: { _id: existing._id },
+						update: { $set: { cmRowIndex: index + 1 } },
+					},
+				})),
+				{ ordered: false }
+			);
+		}
+		sourceIndex =
+			orderedRows.findIndex(
+				(row) => String(row._id) === String(source._id)
+			) + 1;
+	}
+	const rowsToShift = await AssetSource.find({
+		uploadId: upload._id,
+		isDeleted: false,
+		cmRowIndex: { $gt: sourceIndex },
+	})
 		.sort({ cmRowIndex: -1 })
-		.select("cmRowIndex")
+		.select("_id cmRowIndex rowData primaryKey")
 		.lean();
-	const newIndex = (maxRow?.cmRowIndex ?? 0) + 1;
+
+	const uniqueColumn = upload.uniqueColumn;
+	const hasRowIdColumn = (upload.columns || []).includes(
+		AUTO_ROW_ID_COLUMN
+	);
+	if (rowsToShift.length) {
+		await AssetSource.bulkWrite(
+			rowsToShift.map((existing) => {
+				const nextIndex = (existing.cmRowIndex ?? 0) + 1;
+				const setFields = { cmRowIndex: nextIndex };
+				if (hasRowIdColumn) {
+					setFields.rowData = {
+						...(existing.rowData || {}),
+						[AUTO_ROW_ID_COLUMN]: String(nextIndex),
+					};
+					if (isAutoRowIdColumn(uniqueColumn)) {
+						setFields.primaryKey = String(nextIndex);
+					}
+				}
+				return {
+					updateOne: {
+						filter: { _id: existing._id },
+						update: { $set: setFields },
+					},
+				};
+			}),
+			{ ordered: true }
+		);
+	}
+
+	const newIndex = sourceIndex + 1;
 	const rowData = { ...(source.rowData || {}) };
-	if ((upload.columns || []).includes(AUTO_ROW_ID_COLUMN)) {
+	if (hasRowIdColumn) {
 		rowData[AUTO_ROW_ID_COLUMN] = String(newIndex);
 	}
 
-	const uniqueColumn = upload.uniqueColumn;
 	let primaryKey = `row_${newIndex}`;
 	if (uniqueColumn && !isAutoRowIdColumn(uniqueColumn)) {
 		const base = normalizeCellText(rowData[uniqueColumn]);
-		primaryKey = base ? `${base}_copy_${newIndex}` : `row_${newIndex}`;
+		const existingRows = await AssetSource.find({
+			uploadId: upload._id,
+			isDeleted: false,
+		})
+			.select("rowData")
+			.lean();
+		const existingValues = new Set(
+			existingRows
+				.map((existing) =>
+					normalizeCellText(existing.rowData?.[uniqueColumn])
+				)
+				.filter(Boolean)
+		);
+		const baseValue = base || "value";
+		primaryKey = `${baseValue}_copy`;
+		let suffix = 2;
+		while (existingValues.has(primaryKey)) {
+			primaryKey = `${baseValue}_copy_${suffix}`;
+			suffix += 1;
+		}
 		rowData[uniqueColumn] = primaryKey;
 	} else {
 		primaryKey = String(newIndex);
@@ -700,9 +798,206 @@ async function cloneAssetSourceRow(upload, sourceRowId, userId) {
 	return { row, upload };
 }
 
+async function updateColumnImages(
+	upload,
+	targetColumn,
+	prefixColumn,
+	rowIds,
+	userId,
+	template,
+	folder,
+	options = {}
+) {
+	const dryRun = Boolean(options.dryRun);
+	const rowSnapshots = Array.isArray(options.rowSnapshots)
+		? options.rowSnapshots
+		: null;
+
+	assertColumnExists(upload, targetColumn);
+	assertEditableDataColumn(targetColumn);
+
+	const customTemplate = normalizeSearchQuery(
+		template ||
+			(prefixColumn ? `[${String(prefixColumn).trim()}]` : "")
+	);
+	if (!normalizeCellText(customTemplate)) {
+		const err = new Error("Add a format");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	for (const match of customTemplate.matchAll(/\[([^\[\]]+)\]/g)) {
+		const sourceColumn = match[1].trim();
+		if (sourceColumn.toUpperCase() === "SN") continue;
+		assertColumnExists(upload, sourceColumn);
+	}
+
+	let rows;
+	if (rowSnapshots?.length) {
+		rows = rowSnapshots.map((r, i) => ({
+			_id: r._id || r.rowId,
+			rowIndex: r.rowIndex ?? i + 1,
+			rowData:
+				r.rowData && typeof r.rowData === "object" ? r.rowData : {},
+		}));
+	} else {
+		rows = await loadTargetRows(upload._id, rowIds);
+	}
+
+	if (!rows.length) {
+		return {
+			updated: 0,
+			matched: 0,
+			missing: 0,
+			column: targetColumn,
+			updates: [],
+		};
+	}
+
+	const uniqueColumn = upload.uniqueColumn;
+	const folderPath = String(folder || "").trim();
+	const {
+		index,
+		librarySize,
+		folder: resolvedFolder,
+		scope,
+	} = await buildUpdateImagesAssetIndex(upload.accountId, folderPath);
+
+	let matched = 0;
+	let missing = 0;
+	const ops = [];
+	const updates = [];
+	const urlCache = new Map();
+
+	for (let indexInSelection = 0; indexInSelection < rows.length; indexInSelection += 1) {
+		const row = rows[indexInSelection];
+		const assetName = normalizeCellText(
+			customTemplate.replace(
+				/\[([^\[\]]+)\]/g,
+				(_match, column) =>
+					column.trim().toUpperCase() === "SN"
+						? String(indexInSelection + 1)
+						: normalizeCellText(row.rowData?.[column.trim()])
+			)
+		);
+		if (!assetName) {
+			missing += 1;
+			continue;
+		}
+
+		let url = urlCache.get(assetName);
+		if (url === undefined) {
+			url = await resolveAssetUrlWithFallback(
+				upload.accountId,
+				index,
+				assetName
+			);
+			urlCache.set(assetName, url || "");
+		}
+		if (!url) {
+			missing += 1;
+			continue;
+		}
+
+		matched += 1;
+		updates.push({
+			rowId: String(row._id),
+			url,
+		});
+		if (!dryRun) {
+			ops.push({
+				updateOne: {
+					filter: { _id: row._id },
+					update: {
+						$set: cellSetFields(targetColumn, url, uniqueColumn),
+					},
+				},
+			});
+		}
+	}
+
+	if (!dryRun && ops.length) {
+		await AssetSource.bulkWrite(ops);
+		await touchUpload(upload, userId);
+	}
+
+	return {
+		updated: dryRun ? updates.length : ops.length,
+		matched,
+		missing,
+		librarySize,
+		folder: resolvedFolder,
+		scope,
+		column: targetColumn,
+		updates,
+		dryRun,
+	};
+}
+
+/** Write one CDN URL into targetColumn for the given rows (selection upload). */
+async function fillColumnWithCdnUrl(
+	upload,
+	targetColumn,
+	rowIds,
+	cdnUrl,
+	userId
+) {
+	assertColumnExists(upload, targetColumn);
+	assertEditableDataColumn(targetColumn);
+
+	const url = String(cdnUrl || "").trim();
+	if (!url) {
+		const err = new Error("Uploaded image CDN URL was not returned");
+		err.statusCode = 502;
+		throw err;
+	}
+	if (!Array.isArray(rowIds) || rowIds.length === 0) {
+		const err = new Error("Select at least one row");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	const rows = await loadTargetRows(upload._id, rowIds);
+	if (!rows.length) {
+		const err = new Error("Selected rows were not found");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	const uniqueColumn = upload.uniqueColumn;
+	const ops = rows.map((row) => {
+		const nextRowData = {
+			...(row.rowData && typeof row.rowData === "object"
+				? row.rowData
+				: {}),
+			[targetColumn]: normalizeCellText(url),
+		};
+		const fields = { rowData: nextRowData };
+		if (uniqueColumn && targetColumn === uniqueColumn) {
+			fields.primaryKey = normalizeCellText(url);
+		}
+		return {
+			updateOne: {
+				filter: { _id: row._id },
+				update: { $set: fields },
+			},
+		};
+	});
+
+	await AssetSource.bulkWrite(ops);
+	await touchUpload(upload, userId);
+
+	return {
+		updated: ops.length,
+		column: targetColumn,
+		cdnUrl: url,
+	};
+}
+
 module.exports = {
 	fillColumnSequence,
 	copyFromOtherColumn,
+	deleteAssetSourceRow,
 	generateColumnText,
 	fillColumnDate,
 	replaceInColumn,
@@ -715,4 +1010,6 @@ module.exports = {
 	addAssetSourceRow,
 	addAssetSourceColumn,
 	cloneAssetSourceRow,
+	updateColumnImages,
+	fillColumnWithCdnUrl,
 };

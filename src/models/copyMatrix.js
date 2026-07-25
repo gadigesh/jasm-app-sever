@@ -78,6 +78,12 @@ const CopyMatrixSchema = new mongoose.Schema(
 			trim: true,
 			default: null,
 		},
+		/** True after Back/Cancel from a completed edit — resume prompt on next Edit. */
+		hasEditDraft: {
+			type: Boolean,
+			default: false,
+			index: true,
+		},
 	},
 	{ timestamps: true }
 );

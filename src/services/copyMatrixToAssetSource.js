@@ -36,7 +36,11 @@ async function isColumnUnique(copyMatrixId, keyColumn) {
  * Analyze whether a column is unique across all copy-matrix rows.
  * Returns duplicate groups with row indexes / ids for UI highlighting.
  */
-async function analyzeColumnUniqueness(copyMatrixId, keyColumn) {
+async function analyzeColumnUniqueness(
+	copyMatrixId,
+	keyColumn,
+	rowUpdates = []
+) {
 	if (isAutoRowIdColumn(keyColumn)) {
 		return {
 			unique: true,
@@ -52,12 +56,21 @@ async function analyzeColumnUniqueness(copyMatrixId, keyColumn) {
 		.select("_id rowData rowIndex")
 		.sort({ rowIndex: 1 })
 		.lean();
+	const updatesById = new Map(
+		(Array.isArray(rowUpdates) ? rowUpdates : [])
+			.filter((item) => item?._id && item?.rowData)
+			.map((item) => [String(item._id), item.rowData])
+	);
 
 	const byValue = new Map();
 	const emptyRows = [];
 
 	for (const row of cmRows) {
-		const key = normalizeKeyValue(row.rowData?.[keyColumn]);
+		const rowData = {
+			...(row.rowData || {}),
+			...(updatesById.get(String(row._id)) || {}),
+		};
+		const key = normalizeKeyValue(rowData[keyColumn]);
 		if (!key) {
 			emptyRows.push({
 				rowId: String(row._id),
@@ -89,9 +102,8 @@ async function analyzeColumnUniqueness(copyMatrixId, keyColumn) {
 	const emptyRowIndexes = emptyRows.map((r) => r.rowIndex);
 	const emptyRowIds = emptyRows.map((r) => r.rowId);
 
-	// Only duplicate non-empty values block uniqueness.
-	// Empty cells are allowed — primary keys fall back to row_${rowIndex}.
-	const unique = duplicates.length === 0;
+	// A unique column must contain one distinct, non-empty value per row.
+	const unique = duplicates.length === 0 && emptyRows.length === 0;
 
 	let message = null;
 	if (duplicates.length > 0) {
@@ -115,7 +127,7 @@ async function analyzeColumnUniqueness(copyMatrixId, keyColumn) {
 	} else if (emptyRows.length > 0) {
 		message = `${emptyRows.length} empty cell${
 			emptyRows.length === 1 ? "" : "s"
-		} in "${keyColumn}" — those rows will use a row-index key`;
+		} in "${keyColumn}". Fill every value before saving`;
 	}
 
 	return {
@@ -302,7 +314,7 @@ async function resolveLinkedAssetUpload(matrix) {
 
 	if (matrix.assetUploadId) {
 		const linked = await AssetUpload.findById(matrix.assetUploadId).select(
-			"_id copyMatrixId"
+			"_id copyMatrixId columns"
 		);
 		if (linked && String(linked.copyMatrixId) === String(matrixId)) {
 			return linked;
@@ -319,7 +331,7 @@ async function resolveLinkedAssetUpload(matrix) {
 		],
 	})
 		.sort({ createdAt: -1 })
-		.select("_id copyMatrixId");
+		.select("_id copyMatrixId columns");
 
 	if (!upload) return null;
 
