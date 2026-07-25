@@ -141,7 +141,12 @@ async function applyCopyMatrixRowUpdates(matrix, rows, userId) {
 		if (!item._id || !item.rowData) continue;
 		const row = await CopyMatrixRow.findById(item._id);
 		if (!row || String(row.copyMatrixId) !== String(matrix._id)) continue;
-		row.rowData = normalizeRowDataValues(item.rowData);
+		// Draft payloads contain only changed cells. Merge them so saving a
+		// column operation never removes untouched columns from the row.
+		row.rowData = normalizeRowDataValues({
+			...(row.rowData || {}),
+			...item.rowData,
+		});
 		await row.save();
 	}
 
@@ -2049,7 +2054,9 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 				matrix,
 				req.user._id,
 				requestedUnique || matrix.uniqueColumn,
-				forceNewAssetSource ? "" : null
+				// New AS drafts start with the selected CM name. The user can
+				// still change it before Finish if that AS name already exists.
+				null
 			);
 			assetUpload = created.upload;
 			uniqueColumnNotice = created.uniqueColumnNotice;

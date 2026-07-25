@@ -31,6 +31,9 @@ async function findDuplicateCopyMatrixName(accountId, name, excludeId = null) {
 	const query = {
 		accountId,
 		name: { $regex: pattern },
+		// Create drafts are intentionally hidden from the list and may be
+		// abandoned. They must not reserve a name for active records.
+		status: { $ne: "draft" },
 	};
 	if (excludeId) {
 		query._id = { $ne: excludeId };
@@ -46,6 +49,8 @@ async function findDuplicateAssetSourceName(accountId, name, excludeId = null) {
 	const query = {
 		accountId,
 		assetName: { $regex: pattern },
+		// Hidden create drafts should not block a visible CM/AS name.
+		status: { $ne: "draft" },
 	};
 	if (excludeId) {
 		query._id = { $ne: excludeId };

@@ -779,13 +779,15 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 
 		let deletedAssetSourceNames = [];
 		let syncedColumns = [];
+		let copyMatrixName = "";
 		if (upload.copyMatrixId) {
 			const linkedMatrix = await CopyMatrix.findById(
 				upload.copyMatrixId
 			).select(
-				"columns deletedAssetSourceNames lastDeletedAssetSourceName"
+				"name columns deletedAssetSourceNames lastDeletedAssetSourceName"
 			);
 			syncedColumns = linkedMatrix?.columns || [];
+			copyMatrixName = linkedMatrix?.name || "";
 			deletedAssetSourceNames = getDeletedAssetSourceNames(linkedMatrix);
 		}
 
@@ -801,6 +803,7 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 				columns,
 				processedRows: upload.processedRows,
 				copyMatrixId: upload.copyMatrixId,
+				copyMatrixName,
 				syncedColumns,
 				deletedAssetSourceNames,
 				lastDeletedAssetSourceName:
