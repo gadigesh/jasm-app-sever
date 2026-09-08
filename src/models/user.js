@@ -28,6 +28,11 @@ const userSchema = new mongoose.Schema(
 			default: "https://cdn.jivox.com/files/57886/user.png",
 			match: [/^(https):\/\//, "URL must include https"],
 		},
+		googleRefreshToken: {
+			type: String,
+			default: "",
+			select: false,
+		},
 		activeAccountId: {
 			type: mongoose.Schema.Types.ObjectId,
 			ref: "Account",

@@ -3,7 +3,9 @@ const connectDB = require("./config/database");
 const cookieParser = require("cookie-parser");
 const cors = require("cors");
 const app = express();
-app.use(express.json());
+// Column operations send sparse local overrides. Keep a bounded fallback above
+// Express's 100 KB default without allowing unbounded request bodies.
+app.use(express.json({ limit: "5mb" }));
 app.use(cookieParser());
 
 const allowedOrigins = ["http://localhost:5173"];

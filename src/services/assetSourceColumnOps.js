@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const path = require("path");
 const AssetSource = require("../models/assetSource");
 const CopyMatrix = require("../models/copyMatrix");
 const {
@@ -8,6 +9,7 @@ const {
 } = require("../constants/copyMatrix");
 const {
 	buildUpdateImagesAssetIndex,
+	resolveAssetUrlByName,
 	resolveAssetUrlWithFallback,
 } = require("./mindshareAssetLibrary");
 
@@ -18,6 +20,49 @@ function normalizeSearchQuery(value) {
 		.replace(/[\r\n\u000b\u000c\u0085\u2028\u2029\t]+/g, " ")
 		.replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, " ")
 		.replace(/[\u200B\u200C\u200D\uFEFF]/g, "");
+}
+
+function normalizedColumnKey(value) {
+	return normalizeSearchQuery(value).trim().toLowerCase();
+}
+
+function isImageTargetColumn(value) {
+	const column = normalizeSearchQuery(value).trim();
+	const hasImageName =
+		/image/i.test(column) && !/^image$/i.test(column);
+	const hasSizedBackground =
+		/(?:^|[^a-z0-9])bg[12](?:$|[^a-z0-9])/i.test(column) &&
+		/\d{2,5}\s*(?:x|×|by|[-_])\s*\d{2,5}/i.test(column);
+	return hasImageName || hasSizedBackground;
+}
+
+function imageReferenceCandidates(value) {
+	const raw = normalizeCellText(value).trim();
+	if (!raw) return [];
+
+	const candidates = [raw.replace(/\s*\/\s*/g, "/")];
+	try {
+		const parsed = new URL(raw);
+		if (parsed.pathname) {
+			candidates.push(
+				decodeURIComponent(parsed.pathname)
+					.replace(/^\/+|\/+$/g, "")
+					.replace(/\s*\/\s*/g, "/")
+			);
+		}
+	} catch {
+		// The reference is normally a filename/path, not a URL.
+	}
+
+	// A reference cell can contain labels or more than one image token
+	// (for example, "BG1 image1"). Try each BG/image path token as well.
+	for (const match of raw.matchAll(
+		/(?:bg|image)[a-z0-9._-]*(?:\s*\/\s*[a-z0-9._-]+)*/gi
+	)) {
+		candidates.push(match[0].replace(/\s*\/\s*/g, "/"));
+	}
+
+	return [...new Set(candidates.map((candidate) => candidate.trim()).filter(Boolean))];
 }
 
 function assertColumnExists(upload, column) {
@@ -812,9 +857,9 @@ async function updateColumnImages(
 	const rowSnapshots = Array.isArray(options.rowSnapshots)
 		? options.rowSnapshots
 		: null;
-
-	assertColumnExists(upload, targetColumn);
-	assertEditableDataColumn(targetColumn);
+	const rowOverrides = Array.isArray(options.rowOverrides)
+		? options.rowOverrides
+		: null;
 
 	const customTemplate = normalizeSearchQuery(
 		template ||
@@ -832,6 +877,43 @@ async function updateColumnImages(
 		assertColumnExists(upload, sourceColumn);
 	}
 
+	const sourceColumns = new Set(
+		[...customTemplate.matchAll(/\[([^\[\]]+)\]/g)].map((match) =>
+			normalizedColumnKey(match[1])
+		)
+	);
+	const hasNamedTargetSelection =
+		Array.isArray(options.targetColumns) &&
+		options.targetColumns.length > 0;
+	const requestedTargetColumns =
+		hasNamedTargetSelection
+			? options.targetColumns
+			: [targetColumn];
+	const targetColumns = [
+		...new Set(
+			requestedTargetColumns
+				.map((column) => String(column || "").trim())
+				.filter(
+					(column) =>
+						column &&
+						!sourceColumns.has(normalizedColumnKey(column)) &&
+						(!hasNamedTargetSelection ||
+							isImageTargetColumn(column))
+				)
+		),
+	];
+	if (targetColumns.length === 0) {
+		const err = new Error(
+			"Select at least one image or sized BG column to receive the URLs"
+		);
+		err.statusCode = 400;
+		throw err;
+	}
+	for (const column of targetColumns) {
+		assertColumnExists(upload, column);
+		assertEditableDataColumn(column);
+	}
+
 	let rows;
 	if (rowSnapshots?.length) {
 		rows = rowSnapshots.map((r, i) => ({
@@ -844,12 +926,30 @@ async function updateColumnImages(
 		rows = await loadTargetRows(upload._id, rowIds);
 	}
 
+	if (rowOverrides?.length) {
+		const overridesById = new Map(
+			rowOverrides.map((row) => [
+				String(row._id || row.rowId),
+				row.rowData && typeof row.rowData === "object"
+					? row.rowData
+					: {},
+			])
+		);
+		for (const row of rows) {
+			const override = overridesById.get(String(row._id));
+			if (override) {
+				row.rowData = { ...(row.rowData || {}), ...override };
+			}
+		}
+	}
+
 	if (!rows.length) {
 		return {
 			updated: 0,
 			matched: 0,
 			missing: 0,
-			column: targetColumn,
+			column: targetColumns.length === 1 ? targetColumns[0] : null,
+			columns: targetColumns,
 			updates: [],
 		};
 	}
@@ -868,6 +968,139 @@ async function updateColumnImages(
 	const ops = [];
 	const updates = [];
 	const urlCache = new Map();
+	const fallbackUrlCache = new Map();
+	const sizePattern =
+		/(?:^|[^a-z0-9])(\d{2,5})\s*(?:x|×|by|[-_])\s*(\d{2,5})(?=$|[^0-9])/i;
+	const assetNameCandidatesForTarget = (assetName, column) => {
+		const sizeMatch = String(column || "").match(sizePattern);
+		if (!sizeMatch) return [assetName];
+
+		const width = sizeMatch[1];
+		const height = sizeMatch[2];
+		const targetName = String(column || "")
+			.trim()
+			.replace(/\s+/g, "_");
+		const targetStem = String(column || "")
+			.replace(sizePattern, "")
+			.replace(/[_\-\s]+$/g, "")
+			.trim();
+		const backgroundMatch = String(column || "").match(
+			/(?:^|[^a-z0-9])(bg[12])(?=$|[^a-z0-9])/i
+		);
+		const backgroundStem = backgroundMatch?.[1] || "";
+		const targetStems = [
+			...new Set([targetStem, backgroundStem].filter(Boolean)),
+		];
+		const extension = path.extname(assetName);
+		const baseName = extension
+			? assetName.slice(0, -extension.length)
+			: assetName;
+		const sourceSizeMatch = baseName.match(sizePattern);
+		const dimensions = [
+			`${width}x${height}`,
+			`${width}_${height}`,
+			`${width}-${height}`,
+		];
+		const sourceCandidates = [];
+		const genericCandidates = [];
+		const targetCandidates = [];
+		const targetUnsizedCandidates = [];
+
+		if (sourceSizeMatch) {
+			const sourceSize = `${sourceSizeMatch[1]}x${sourceSizeMatch[2]}`;
+			if (sourceSize === `${width}x${height}`) {
+				sourceCandidates.push(assetName);
+			} else {
+				const prefix = sourceSizeMatch[0].match(/^[^0-9]*/)?.[0] || "";
+				for (const dimension of dimensions) {
+					sourceCandidates.push(
+						`${baseName.slice(
+							0,
+							sourceSizeMatch.index
+						)}${prefix}${dimension}${baseName.slice(
+							sourceSizeMatch.index + sourceSizeMatch[0].length
+						)}${extension}`
+					);
+				}
+			}
+		}
+
+		const versionSuffix = baseName.match(/^(.*?)([_-]r\d+)$/i);
+		for (const dimension of dimensions) {
+			for (const separator of ["_", "-", ""]) {
+				genericCandidates.push(
+					`${baseName}${separator}${dimension}${extension}`
+				);
+				if (targetName) {
+					const targetNames = [targetName];
+					if (backgroundStem) {
+						targetNames.push(
+							`${backgroundStem}${separator}${dimension}`
+						);
+					}
+					for (const targetPart of targetNames) {
+						targetCandidates.push(
+							`${baseName}${separator}${targetPart}${extension}`
+						);
+						targetCandidates.push(
+							`${targetPart}${separator}${baseName}${extension}`
+						);
+					}
+				}
+				for (const targetPart of targetStems) {
+					// Support assets stored under BG folders, as well as
+					// filenames that combine the reference image and target
+					// column (for example image1_bg2_300x600).
+					targetCandidates.push(
+						`${targetPart}/${baseName}${separator}${dimension}${extension}`
+					);
+					targetCandidates.push(
+						`${baseName}/${targetPart}${separator}${dimension}${extension}`
+					);
+					targetCandidates.push(
+						`${baseName}${separator}${targetPart}${separator}${dimension}${extension}`
+					);
+					targetCandidates.push(
+						`${targetPart}${separator}${baseName}${separator}${dimension}${extension}`
+					);
+					if (/^bg[12]$/i.test(targetPart)) {
+						// Some libraries encode the BG target in the folder
+						// (`bg2/.../image1`) while the sheet column carries the
+						// size. Prefer this target-specific path over a generic
+						// unsized basename.
+						targetUnsizedCandidates.push(
+							`${targetPart}/${baseName}${extension}`
+						);
+						targetUnsizedCandidates.push(
+							`${baseName}/${targetPart}${extension}`
+						);
+					}
+				}
+				if (versionSuffix) {
+					genericCandidates.push(
+						`${versionSuffix[1]}${separator}${dimension}${versionSuffix[2]}${extension}`
+					);
+				}
+			}
+		}
+
+		const targetIsSizedBackground = /^bg[12]$/i.test(backgroundStem);
+		const orderedCandidates =
+			targetIsSizedBackground && !String(assetName).includes("/")
+				? [
+						...targetCandidates,
+						...sourceCandidates,
+						...genericCandidates,
+						...targetUnsizedCandidates,
+				  ]
+				: [
+						...sourceCandidates,
+						...genericCandidates,
+						...targetCandidates,
+						...targetUnsizedCandidates,
+				  ];
+		return [...new Set(orderedCandidates)];
+	};
 
 	for (let indexInSelection = 0; indexInSelection < rows.length; indexInSelection += 1) {
 		const row = rows[indexInSelection];
@@ -881,38 +1114,108 @@ async function updateColumnImages(
 			)
 		);
 		if (!assetName) {
-			missing += 1;
+			missing += targetColumns.length;
 			continue;
 		}
+		const referenceCandidates = imageReferenceCandidates(assetName);
 
-		let url = urlCache.get(assetName);
-		if (url === undefined) {
-			url = await resolveAssetUrlWithFallback(
-				upload.accountId,
-				index,
-				assetName
+		for (const column of targetColumns) {
+			const columnCandidates = imageReferenceCandidates(column);
+			const referencePathCandidates = referenceCandidates.filter((candidate) =>
+				candidate.includes("/")
 			);
-			urlCache.set(assetName, url || "");
-		}
-		if (!url) {
-			missing += 1;
-			continue;
-		}
+			const referenceNameCandidates = referenceCandidates.filter(
+				(candidate) => !candidate.includes("/")
+			);
+			const columnPathCandidates = columnCandidates.filter((candidate) =>
+				candidate.includes("/")
+			);
+			const columnNameCandidates = columnCandidates.filter(
+				(candidate) => !candidate.includes("/")
+			);
+			const candidates = [
+				...new Set(
+					[
+						// A complete frame path is authoritative.
+						...referencePathCandidates.flatMap((reference) =>
+							assetNameCandidatesForTarget(reference, column)
+						),
+						// If the reference only contains `image1`, use the
+						// target column (`bg1`/`bg2`/`image1`) to select the
+						// correct frame before trying a generic basename.
+						...referenceCandidates.flatMap((reference) =>
+							[
+								...columnPathCandidates,
+								...columnNameCandidates,
+							].flatMap((columnPart) =>
+								[
+									...assetNameCandidatesForTarget(
+										`${reference}/${columnPart}`,
+										column
+									),
+									...assetNameCandidatesForTarget(
+										`${columnPart}/${reference}`,
+										column
+									),
+								]
+							)
+						),
+						...referenceNameCandidates.flatMap((reference) =>
+							assetNameCandidatesForTarget(reference, column)
+						),
+					]
+				),
+			];
+			const cacheKey = `${column}\u0000${candidates.join("\u0000")}`;
+			let url = urlCache.get(cacheKey);
+			if (url === undefined) {
+				url = "";
+				for (const candidate of candidates) {
+					url = resolveAssetUrlByName(index, candidate);
+					if (url) break;
+				}
+				// The recursive index normally resolves every asset. Keep the
+				// remote fallback as a compatibility path, but only try the
+				// most-specific candidates and cache each request so a large
+				// sheet does not issue one network call per cell.
+				if (!url) {
+					for (const candidate of candidates.slice(0, 4)) {
+						let fallbackPromise = fallbackUrlCache.get(candidate);
+						if (!fallbackPromise) {
+							fallbackPromise = resolveAssetUrlWithFallback(
+								upload.accountId,
+								index,
+								candidate
+							);
+							fallbackUrlCache.set(candidate, fallbackPromise);
+						}
+						url = await fallbackPromise;
+						if (url) break;
+					}
+				}
+				urlCache.set(cacheKey, url || "");
+			}
+			if (!url) {
+				missing += 1;
+				continue;
+			}
 
-		matched += 1;
-		updates.push({
-			rowId: String(row._id),
-			url,
-		});
-		if (!dryRun) {
-			ops.push({
-				updateOne: {
-					filter: { _id: row._id },
-					update: {
-						$set: cellSetFields(targetColumn, url, uniqueColumn),
-					},
-				},
+			matched += 1;
+			updates.push({
+				rowId: String(row._id),
+				column,
+				url,
 			});
+			if (!dryRun) {
+				ops.push({
+					updateOne: {
+						filter: { _id: row._id },
+						update: {
+							$set: cellSetFields(column, url, uniqueColumn),
+						},
+					},
+				});
+			}
 		}
 	}
 
@@ -928,7 +1231,8 @@ async function updateColumnImages(
 		librarySize,
 		folder: resolvedFolder,
 		scope,
-		column: targetColumn,
+		column: targetColumns.length === 1 ? targetColumns[0] : null,
+		columns: targetColumns,
 		updates,
 		dryRun,
 	};

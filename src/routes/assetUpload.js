@@ -4,11 +4,15 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const mongoose = require("mongoose");
+const ExcelJS = require("exceljs");
+const { google } = require("googleapis");
+const jwt = require("jsonwebtoken");
 
 // Models & Services
 const AssetUpload = require("../models/assetUpload");
 const AssetSource = require("../models/assetSource");
 const CopyMatrix = require("../models/copyMatrix");
+const User = require("../models/user");
 const storageService = require("../services/storage");
 const { processUpload } = require("../services/processors");
 const { updateAssetWithHistory } = require("../services/assetServices");
@@ -51,6 +55,12 @@ const {
 	listAccountFolders,
 	resolveUploadedCdnUrl,
 } = require("../services/mindshareAssetLibrary");
+const {
+	buildRowFilter,
+	buildRowSort,
+	normalizeFilterValue,
+	sortFilterValues,
+} = require("../utils/rowFilters");
 
 const assetRouter = express.Router();
 
@@ -153,6 +163,81 @@ const upload = multer({
 	dest: "temp_uploads/",
 	limits: { fileSize: 500 * 1024 * 1024 }, // 500MB limit
 });
+
+const getWritableGoogleAuth = () =>
+	new google.auth.GoogleAuth({
+		keyFile: process.env.GOOGLE_CREDENTIALS_FILE || "google-credentials.json",
+		scopes: [
+			"https://www.googleapis.com/auth/spreadsheets",
+			"https://www.googleapis.com/auth/drive.file",
+		],
+	});
+
+const GOOGLE_OAUTH_SCOPES = [
+	"https://www.googleapis.com/auth/spreadsheets",
+	"https://www.googleapis.com/auth/drive.file",
+];
+
+const hasGoogleOAuthConfig = () =>
+	Boolean(
+		process.env.GOOGLE_OAUTH_CLIENT_ID &&
+			process.env.GOOGLE_OAUTH_CLIENT_SECRET
+	);
+
+const getGoogleOAuthClient = () => {
+	if (!hasGoogleOAuthConfig()) {
+		throw new Error(
+			"Google OAuth is not configured. Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET."
+		);
+	}
+	return new google.auth.OAuth2(
+		process.env.GOOGLE_OAUTH_CLIENT_ID,
+		process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+		process.env.GOOGLE_OAUTH_REDIRECT_URI ||
+			"http://localhost:3333/auth/google/callback"
+	);
+};
+
+const getGoogleOAuthAuthorizationUrl = (assetId, userId) => {
+	const client = getGoogleOAuthClient();
+	const state = jwt.sign(
+		{
+			userId: String(userId),
+			assetId: String(assetId),
+		},
+		process.env.TOKEN_SECRETE_KEY,
+		{ expiresIn: "10m" }
+	);
+	return client.generateAuthUrl({
+		access_type: "offline",
+		prompt: "consent",
+		scope: GOOGLE_OAUTH_SCOPES,
+		state,
+	});
+};
+
+const quoteSheetTitle = (title) =>
+	`'${String(title || "Sheet1").replace(/'/g, "''")}'`;
+
+const runGoogleRequestWithRetry = async (request, attempts = 3) => {
+	let lastError;
+	for (let attempt = 0; attempt < attempts; attempt += 1) {
+		try {
+			return await request();
+		} catch (error) {
+			lastError = error;
+			const status = error?.code || error?.response?.status;
+			const retryable = [429, 500, 502, 503, 504].includes(
+				Number(status)
+			);
+			if (!retryable || attempt === attempts - 1) break;
+			await new Promise((resolve) =>
+				setTimeout(resolve, 500 * 2 ** attempt)
+			);
+		}
+	}
+	throw lastError;
+};
 
 function parseCopyMatrixIdFromFileRef(fileRef) {
 	const match = String(fileRef || "").match(/^copy-matrix:\/\/(.+)$/);
@@ -752,6 +837,434 @@ assetRouter.get("/source/:id/export", userAuth, async (req, res) => {
 	}
 });
 
+assetRouter.get("/source/:id/export/excel", userAuth, async (req, res) => {
+	try {
+		const upload = await AssetUpload.findById(req.params.id).lean();
+		if (!upload) {
+			return res.status(404).json({ message: "Asset source not found" });
+		}
+
+		const rows = await AssetSource.find({
+			uploadId: upload._id,
+			isDeleted: false,
+		})
+			.sort({ cmRowIndex: 1, primaryKey: 1 })
+			.lean();
+		const columns =
+			upload.columns?.length > 0
+				? upload.columns
+				: rows[0]?.rowData
+					? Object.keys(rows[0].rowData)
+					: [];
+
+		const workbook = new ExcelJS.Workbook();
+		const worksheet = workbook.addWorksheet("Asset Source");
+		worksheet.addRow(columns);
+		for (const row of rows) {
+			worksheet.addRow(
+				columns.map((column) => row.rowData?.[column] ?? "")
+			);
+		}
+		worksheet.getRow(1).font = { bold: true };
+		worksheet.views = [{ state: "frozen", ySplit: 1 }];
+		worksheet.columns = columns.map((column) => ({
+			header: column,
+			key: column,
+			width: Math.min(40, Math.max(12, String(column).length + 2)),
+		}));
+
+		const filename = String(
+			upload.assetName || upload.fileName || "asset-source"
+		).replace(/["\\/:*?<>|\r\n]+/g, "_");
+		res.setHeader(
+			"Content-Type",
+			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		);
+		res.setHeader(
+			"Content-Disposition",
+			`attachment; filename="${filename}.xlsx"`
+		);
+		await workbook.xlsx.write(res);
+		res.end();
+	} catch (err) {
+		console.error(err);
+		if (!res.headersSent) {
+			res
+				.status(500)
+				.json({ message: "Failed to export asset source as Excel" });
+		}
+	}
+});
+
+assetRouter.get("/auth/google/callback", async (req, res) => {
+	const frontendBaseUrl =
+		process.env.FRONTEND_APP_URL || "http://localhost:5173";
+
+	try {
+		if (req.query.error) {
+			const target = new URL("/asset-sources", frontendBaseUrl);
+			target.searchParams.set("googleAuth", "error");
+			target.searchParams.set(
+				"message",
+				String(req.query.error_description || req.query.error)
+			);
+			return res.redirect(target.toString());
+		}
+
+		const state = jwt.verify(
+			String(req.query.state || ""),
+			process.env.TOKEN_SECRETE_KEY
+		);
+		const code = String(req.query.code || "").trim();
+		if (!code || !state?.userId || !state?.assetId) {
+			throw new Error("Invalid Google authorization response");
+		}
+
+		const client = getGoogleOAuthClient();
+		const { tokens } = await client.getToken(code);
+		if (!tokens.refresh_token) {
+			throw new Error(
+				"Google did not return a refresh token. Please approve access again."
+			);
+		}
+
+		await User.findByIdAndUpdate(state.userId, {
+			$set: { googleRefreshToken: tokens.refresh_token },
+		});
+
+		const target = new URL(
+			`/asset-sources/${state.assetId}/success`,
+			frontendBaseUrl
+		);
+		target.searchParams.set("googleAuth", "success");
+		return res.redirect(target.toString());
+	} catch (err) {
+		console.error("Google OAuth callback failed:", err);
+		const target = new URL("/asset-sources", frontendBaseUrl);
+		target.searchParams.set("googleAuth", "error");
+		target.searchParams.set(
+			"message",
+			err.message || "Google authorization failed"
+		);
+		return res.redirect(target.toString());
+	}
+});
+
+assetRouter.post("/source/:id/google-sheet", userAuth, async (req, res) => {
+	let createdSpreadsheetId = "";
+	let spreadsheetId = "";
+	let driveApi = null;
+	let oauthUser = null;
+	let usingUserOAuth = false;
+
+	try {
+		const upload = await AssetUpload.findById(req.params.id);
+		if (!upload) {
+			return res.status(404).json({ message: "Asset source not found" });
+		}
+		if (upload.status === "draft") {
+			return res
+				.status(400)
+				.json({ message: "Finish the asset source before creating a Google Sheet" });
+		}
+
+		const existingSpreadsheetId = String(
+			upload.generatedGoogleSheetId || ""
+		).trim();
+		const updatingExistingSheet = Boolean(existingSpreadsheetId);
+		const sharedDriveFolderId = String(
+			process.env.GOOGLE_SHARED_DRIVE_FOLDER_ID || ""
+		).trim();
+
+		oauthUser = await User.findById(req.user._id).select(
+			"+googleRefreshToken"
+		);
+		let auth;
+		const storedServiceAccountSheet =
+			updatingExistingSheet &&
+			upload.generatedGoogleSheetAuthType === "service-account";
+		if (storedServiceAccountSheet && sharedDriveFolderId) {
+			auth = getWritableGoogleAuth();
+		} else if (oauthUser?.googleRefreshToken) {
+			const oauthClient = getGoogleOAuthClient();
+			oauthClient.setCredentials({
+				refresh_token: oauthUser.googleRefreshToken,
+			});
+			auth = oauthClient;
+			usingUserOAuth = true;
+		} else if (hasGoogleOAuthConfig()) {
+			return res.status(200).json({
+				message: "Google authorization required",
+				data: {
+					authorizationRequired: true,
+					authorizationUrl: getGoogleOAuthAuthorizationUrl(
+						req.params.id,
+						req.user._id
+					),
+				},
+			});
+		} else if (
+			String(process.env.GOOGLE_SHARED_DRIVE_FOLDER_ID || "").trim()
+		) {
+			auth = getWritableGoogleAuth();
+		} else {
+			return res.status(500).json({
+				message:
+					"Google OAuth is not configured. Add GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_OAUTH_REDIRECT_URI to the server environment.",
+			});
+		}
+
+		const rows = await AssetSource.find({
+			uploadId: upload._id,
+			isDeleted: false,
+		})
+			.sort({ cmRowIndex: 1, primaryKey: 1 })
+			.lean();
+		const columns =
+			upload.columns?.length > 0
+				? upload.columns
+				: rows[0]?.rowData
+					? Object.keys(rows[0].rowData)
+					: [];
+		const values = [
+			columns,
+			...rows.map((row) =>
+				columns.map((column) => {
+					const value = row.rowData?.[column];
+					if (value == null) return "";
+					return typeof value === "object"
+						? JSON.stringify(value)
+						: value;
+				})
+			),
+		];
+
+		const sheetsApi = google.sheets({ version: "v4", auth });
+		driveApi = google.drive({ version: "v3", auth });
+		const spreadsheetTitle =
+			String(upload.assetName || "Asset Source").trim() || "Asset Source";
+		let sheet;
+
+		if (updatingExistingSheet) {
+			spreadsheetId = existingSpreadsheetId;
+			const metadata = await runGoogleRequestWithRetry(() =>
+				sheetsApi.spreadsheets.get({
+					spreadsheetId,
+					fields: "sheets.properties",
+				})
+			);
+			sheet = metadata.data.sheets?.[0];
+		} else if (sharedDriveFolderId) {
+			const createdFile = await runGoogleRequestWithRetry(() =>
+				driveApi.files.create({
+					requestBody: {
+						name: spreadsheetTitle,
+						mimeType: "application/vnd.google-apps.spreadsheet",
+						parents: [sharedDriveFolderId],
+					},
+					fields: "id",
+					supportsAllDrives: true,
+				})
+			);
+			createdSpreadsheetId = createdFile.data.id;
+			spreadsheetId = createdSpreadsheetId;
+			const metadata = await runGoogleRequestWithRetry(() =>
+				sheetsApi.spreadsheets.get({
+					spreadsheetId,
+					fields: "sheets.properties",
+				})
+			);
+			sheet = metadata.data.sheets?.[0];
+		} else {
+			const created = await runGoogleRequestWithRetry(() =>
+				sheetsApi.spreadsheets.create({
+					requestBody: {
+						properties: { title: spreadsheetTitle },
+					},
+					fields: "spreadsheetId,sheets.properties",
+				})
+			);
+			createdSpreadsheetId = created.data.spreadsheetId;
+			spreadsheetId = createdSpreadsheetId;
+			sheet = created.data.sheets?.[0];
+		}
+
+		const sheetId = sheet?.properties?.sheetId;
+		const sheetTitle = sheet?.properties?.title || "Sheet1";
+		if (!spreadsheetId || sheetId == null) {
+			throw new Error("Google did not return the new spreadsheet details");
+		}
+
+		if (updatingExistingSheet) {
+			await runGoogleRequestWithRetry(() =>
+				sheetsApi.spreadsheets.values.clear({
+					spreadsheetId,
+					range: `${quoteSheetTitle(sheetTitle)}!A:ZZZ`,
+					requestBody: {},
+				})
+			);
+		}
+
+		const batchSize = 1000;
+		for (let start = 0; start < values.length; start += batchSize) {
+			await runGoogleRequestWithRetry(() =>
+				sheetsApi.spreadsheets.values.update({
+					spreadsheetId,
+					range: `${quoteSheetTitle(sheetTitle)}!A${start + 1}`,
+					valueInputOption: "RAW",
+					requestBody: {
+						values: values.slice(start, start + batchSize),
+					},
+				})
+			);
+		}
+
+		if (columns.length > 0) {
+			await runGoogleRequestWithRetry(() =>
+				sheetsApi.spreadsheets.batchUpdate({
+					spreadsheetId,
+					requestBody: {
+						requests: [
+							{
+								updateSheetProperties: {
+									properties: {
+										sheetId,
+										gridProperties: { frozenRowCount: 1 },
+									},
+									fields: "gridProperties.frozenRowCount",
+								},
+							},
+							{
+								repeatCell: {
+									range: {
+										sheetId,
+										startRowIndex: 0,
+										endRowIndex: 1,
+										startColumnIndex: 0,
+										endColumnIndex: columns.length,
+									},
+									cell: {
+										userEnteredFormat: {
+											textFormat: { bold: true },
+										},
+									},
+									fields: "userEnteredFormat.textFormat.bold",
+								},
+							},
+						],
+					},
+				})
+			);
+		}
+
+		await runGoogleRequestWithRetry(() =>
+			sheetsApi.spreadsheets.batchUpdate({
+				spreadsheetId,
+				requestBody: {
+					requests: [
+						{
+							updateSpreadsheetProperties: {
+								properties: { title: spreadsheetTitle },
+								fields: "title",
+							},
+						},
+					],
+				},
+			})
+		);
+
+		if (!usingUserOAuth && !updatingExistingSheet) {
+			const emailAddress = String(req.user?.emailId || "").trim();
+			if (!emailAddress) {
+				throw new Error(
+					"Your account email is required to share the generated Google Sheet"
+				);
+			}
+			await runGoogleRequestWithRetry(() =>
+				driveApi.permissions.create({
+					fileId: spreadsheetId,
+					requestBody: {
+						type: "user",
+						role: "reader",
+						emailAddress,
+					},
+					sendNotificationEmail: false,
+					fields: "id",
+				})
+			);
+		}
+
+		const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+		upload.generatedGoogleSheetId = spreadsheetId;
+		upload.generatedGoogleSheetUrl = url;
+		upload.generatedGoogleSheetAuthType = usingUserOAuth
+			? "oauth"
+			: "service-account";
+		await upload.save();
+
+		return res.status(updatingExistingSheet ? 200 : 201).json({
+			message: updatingExistingSheet
+				? "Google Sheet updated successfully"
+				: "Google Sheet created successfully",
+			data: {
+				url,
+				spreadsheetId,
+				reused: updatingExistingSheet,
+				updated: updatingExistingSheet,
+			},
+		});
+	} catch (err) {
+		if (createdSpreadsheetId && driveApi) {
+			try {
+				await driveApi.files.delete({
+					fileId: createdSpreadsheetId,
+					supportsAllDrives: true,
+				});
+			} catch (cleanupError) {
+				console.error(
+					"Failed to clean up generated Google Sheet:",
+					cleanupError.message
+				);
+			}
+		}
+		console.error(err);
+		if (
+			usingUserOAuth &&
+			oauthUser &&
+			(err?.response?.data?.error === "invalid_grant" ||
+				err?.response?.data?.error_description?.includes(
+					"Token has been expired or revoked"
+				))
+		) {
+			oauthUser.googleRefreshToken = "";
+			await oauthUser.save();
+			return res.status(200).json({
+				message: "Google authorization required",
+				data: {
+					authorizationRequired: true,
+					authorizationUrl: getGoogleOAuthAuthorizationUrl(
+						req.params.id,
+						req.user._id
+					),
+				},
+			});
+		}
+		const isPermissionError =
+			err?.code === 403 || err?.response?.status === 403;
+		const isTransientGoogleError = [429, 500, 502, 503, 504].includes(
+			Number(err?.code || err?.response?.status)
+		);
+		res.status(500).json({
+			message: isTransientGoogleError
+				? "Google Sheets is temporarily unavailable. Please try again."
+				: isPermissionError
+				? "Google denied spreadsheet creation. Configure GOOGLE_SHARED_DRIVE_FOLDER_ID with a shared-drive folder where the service account has Editor access, or use Google OAuth credentials."
+				: err.message ||
+					"Failed to create a Google Sheet for this asset source",
+		});
+	}
+});
+
 // =====================================================================
 // ROUTE 4: GET ASSET SOURCE DETAIL (draft or completed)
 // URL: GET /source/:id
@@ -798,6 +1311,13 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 				accountId: upload.accountId,
 				name: upload.assetName,
 				fileName: upload.fileName,
+				inputType: upload.inputType,
+				googleSheetUrl:
+					upload.inputType === "gsheet" &&
+					String(upload.fileRef || "").trim()
+						? String(upload.fileRef).trim()
+						: "",
+				generatedGoogleSheetUrl: upload.generatedGoogleSheetUrl || "",
 				status: upload.status,
 				uniqueColumn: upload.uniqueColumn,
 				columns,
@@ -825,6 +1345,48 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 // ROUTE 5: GET ASSET SOURCE ROWS (paginated)
 // URL: GET /source/:id/rows
 // =====================================================================
+assetRouter.get("/source/:id/rows/values", userAuth, async (req, res) => {
+	try {
+		const upload = await AssetUpload.findById(req.params.id).select(
+			"columns"
+		);
+		if (!upload) {
+			return res.status(404).json({ message: "Asset source not found" });
+		}
+
+		const column = String(req.query.column || "").trim();
+		const columns = upload.columns || [];
+		if (!column || !columns.includes(column)) {
+			return res.status(400).json({
+				message: "A valid column is required",
+			});
+		}
+
+		const values = await AssetSource.distinct(
+			`rowData.${column}`,
+			{
+				uploadId: upload._id,
+				isDeleted: false,
+			}
+		);
+
+		return res.status(200).json({
+			message: "Column values fetched successfully",
+			data: {
+				column,
+				values: sortFilterValues(
+					values.map(normalizeFilterValue)
+				),
+			},
+		});
+	} catch (err) {
+		console.error(err);
+		return res
+			.status(500)
+			.json({ message: "Failed to fetch column values" });
+	}
+});
+
 assetRouter.get("/source/:id/rows", userAuth, async (req, res) => {
 	try {
 		const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
@@ -839,26 +1401,41 @@ assetRouter.get("/source/:id/rows", userAuth, async (req, res) => {
 			return res.status(404).json({ message: "Asset source not found" });
 		}
 
-		const filter = { uploadId: upload._id, isDeleted: false };
+		const columns =
+			upload.columns?.length > 0
+				? upload.columns
+				: [];
+		const filter = buildRowFilter(
+			{ uploadId: upload._id, isDeleted: false },
+			req.query.filters,
+			columns,
+			AUTO_ROW_ID_COLUMN
+		);
 
-		const sortOrder = { cmRowIndex: 1, primaryKey: 1 };
+		const sortOrder = buildRowSort(
+			String(req.query.sortColumn || "").trim(),
+			req.query.sortDirection,
+			columns,
+			AUTO_ROW_ID_COLUMN,
+			{ cmRowIndex: 1, primaryKey: 1 }
+		);
 
 		const [rows, total] = await Promise.all([
 			AssetSource.find(filter).sort(sortOrder).skip(skip).limit(limit).lean(),
 			AssetSource.countDocuments(filter),
 		]);
 
-		const columns =
-			upload.columns?.length > 0
-				? upload.columns
+		const responseColumns =
+			columns.length > 0
+				? columns
 				: rows[0]?.rowData
-				? Object.keys(rows[0].rowData)
-				: [];
+					? Object.keys(rows[0].rowData)
+					: [];
 
 		res.status(200).json({
 			message: "Rows fetched successfully",
 			data: {
-				columns,
+				columns: responseColumns,
 				rows: rows.map((row, idx) => ({
 					_id: row._id,
 					rowIndex: row.cmRowIndex ?? skip + idx + 1,
@@ -1357,14 +1934,15 @@ assetRouter.post(
 			const asset = await loadUploadOr404(req, res);
 			if (!asset) return;
 
-			const result = await uploadAssetsToAccount(
-				asset.accountId,
-				tempFiles
-			);
-
 			const folder = String(
 				req.body?.folder || req.query?.folder || ""
 			).trim();
+			const result = await uploadAssetsToAccount(
+				asset.accountId,
+				tempFiles,
+				folder
+			);
+
 			const targetColumn = String(
 				req.body?.targetColumn || req.query?.targetColumn || ""
 			).trim();
@@ -1381,8 +1959,8 @@ assetRouter.post(
 			const cdnUrl = await resolveUploadedCdnUrl(
 				asset.accountId,
 				result,
-				tempFiles,
-				folder
+				result.uploadedFiles || tempFiles,
+				result.folder || folder
 			);
 
 			let applied = null;
@@ -1481,12 +2059,14 @@ assetRouter.post(
 			if (!asset) return;
 			const {
 				targetColumn,
+				targetColumns,
 				prefixColumn,
 				template,
 				folder,
 				rowIds,
 				dryRun,
 				rowSnapshots,
+				rowOverrides,
 			} = req.body;
 			const result = await updateColumnImages(
 				asset,
@@ -1496,7 +2076,7 @@ assetRouter.post(
 				req.user._id,
 				template,
 				folder,
-				{ dryRun, rowSnapshots }
+				{ dryRun, rowSnapshots, rowOverrides, targetColumns }
 			);
 			res.status(200).json({
 				message: result.dryRun

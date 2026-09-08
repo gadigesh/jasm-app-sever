@@ -1,7 +1,30 @@
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const { pipeline } = require("stream/promises");
+const { Transform } = require("stream");
+const unzipper = require("unzipper");
 
 const DEFAULT_BASE_URL = process.env.MINDSHARE_API_BASE_URL;
+const MAX_UPLOAD_BATCH_BYTES = 9 * 1024 * 1024;
+const MAX_EXTRACTED_ZIP_BYTES = 500 * 1024 * 1024;
+const MAX_ZIP_ENTRIES = 500;
+const UPDATE_IMAGES_INDEX_CACHE_TTL_MS = 30 * 1000;
+const updateImagesIndexCache = new Map();
+const IMAGE_EXTENSIONS =
+	/\.(?:avif|bmp|gif|jpe?g|png|svg|webp|tiff?)$/i;
+const MIME_TYPES_BY_EXTENSION = {
+	avif: "image/avif",
+	bmp: "image/bmp",
+	gif: "image/gif",
+	jpg: "image/jpeg",
+	jpeg: "image/jpeg",
+	png: "image/png",
+	svg: "image/svg+xml",
+	webp: "image/webp",
+	tif: "image/tiff",
+	tiff: "image/tiff",
+};
 
 function getBaseUrl() {
 	return String(process.env.MINDSHARE_API_BASE_URL || DEFAULT_BASE_URL)
@@ -181,28 +204,255 @@ async function parseJsonSafe(response) {
 	}
 }
 
-async function uploadAssetsToAccount(accountId, files = []) {
-	const advId = await resolveAccountAdvId(accountId);
-	if (!Array.isArray(files) || files.length === 0) {
-		const err = new Error("At least one image or zip file is required");
+function isZipFile(file) {
+	return (
+		/application\/(?:x-)?zip/i.test(String(file?.mimetype || "")) ||
+		/\.zip$/i.test(String(file?.originalname || file?.name || ""))
+	);
+}
+
+function isImageFileName(fileName) {
+	return IMAGE_EXTENSIONS.test(String(fileName || "").trim());
+}
+
+function mimeTypeForFileName(fileName) {
+	const extension = path
+		.extname(String(fileName || ""))
+		.slice(1)
+		.toLowerCase();
+	return MIME_TYPES_BY_EXTENSION[extension] || "application/octet-stream";
+}
+
+function safeZipEntryName(entryName) {
+	const normalized = path.posix.normalize(
+		String(entryName || "").replace(/\\/g, "/")
+	);
+	if (
+		!normalized ||
+		normalized === "." ||
+		normalized.startsWith("/") ||
+		normalized.split("/").includes("..")
+	) {
+		return "";
+	}
+	return normalized;
+}
+
+async function extractZipImages(file, extractionDirectory) {
+	const directory = await unzipper.Open.file(file.path);
+	const extractedFiles = [];
+	let extractedBytes = 0;
+
+	for (const entry of directory.files) {
+		if (entry.type !== "File") continue;
+
+		const entryName = safeZipEntryName(entry.path);
+		const fileName = path.posix.basename(entryName);
+		if (
+			!entryName ||
+			!fileName ||
+			fileName.startsWith(".") ||
+			!isImageFileName(fileName)
+		) {
+			continue;
+		}
+		if (extractedFiles.length >= MAX_ZIP_ENTRIES) {
+			const err = new Error(
+				`ZIP contains more than ${MAX_ZIP_ENTRIES} image files`
+			);
+			err.statusCode = 413;
+			throw err;
+		}
+		const targetPath = path.join(
+			extractionDirectory,
+			`${String(extractedFiles.length).padStart(4, "0")}-${fileName}`
+		);
+		let entryBytes = 0;
+		const counter = new Transform({
+			transform(chunk, _encoding, callback) {
+				entryBytes += chunk.length;
+				extractedBytes += chunk.length;
+				if (extractedBytes > MAX_EXTRACTED_ZIP_BYTES) {
+					const error = new Error(
+						"Extracted ZIP contents exceed the 500 MB limit"
+					);
+					error.statusCode = 413;
+					callback(error);
+					return;
+				}
+				this.push(chunk);
+				callback();
+			},
+		});
+
+		try {
+			await pipeline(
+				entry.stream(),
+				counter,
+				fs.createWriteStream(targetPath)
+			);
+		} catch (error) {
+			await fs.promises.unlink(targetPath).catch(() => {});
+			throw error;
+		}
+
+		extractedFiles.push({
+			path: targetPath,
+			originalname: fileName,
+			mimetype: mimeTypeForFileName(fileName),
+			size: entryBytes,
+			// Keep the ZIP's internal directories so frame paths such as
+			// bg1/BG1/Frame1/image1 remain addressable after upload.
+			relativeFolder:
+				path.posix.dirname(entryName) === "."
+					? ""
+					: path.posix.dirname(entryName),
+		});
+	}
+
+	if (extractedFiles.length === 0) {
+		const err = new Error("ZIP does not contain any supported image files");
 		err.statusCode = 400;
 		throw err;
 	}
 
-	const form = new FormData();
+	return extractedFiles;
+}
+
+async function getFileSize(file) {
+	if (Number.isFinite(Number(file?.size))) return Number(file.size);
+	try {
+		const stats = await fs.promises.stat(file.path);
+		return stats.size;
+	} catch {
+		return 0;
+	}
+}
+
+function zipFolderName(file) {
+	const originalName = path.basename(
+		String(file?.originalname || file?.name || "")
+	);
+	const folderName = originalName.replace(/\.zip$/i, "").trim();
+	if (!folderName || folderName === "." || folderName === "..") {
+		const err = new Error("ZIP filename must provide a folder name");
+		err.statusCode = 400;
+		throw err;
+	}
+	return folderName;
+}
+
+function joinUploadFolder(parentFolder, childFolder) {
+	const parent = String(parentFolder || "").trim().replace(/^\/+|\/+$/g, "");
+	const child = String(childFolder || "").trim().replace(/^\/+|\/+$/g, "");
+	if (!parent) return child;
+	if (
+		parent
+			.split("/")
+			.pop()
+			.toLowerCase() === child.toLowerCase()
+	) {
+		return parent;
+	}
+	return child ? `${parent}/${child}` : parent;
+}
+
+function appendUploadFolder(parentFolder, childFolder) {
+	const parent = String(parentFolder || "").trim().replace(/^\/+|\/+$/g, "");
+	const child = String(childFolder || "").trim().replace(/^\/+|\/+$/g, "");
+	if (!parent) return child;
+	return child ? `${parent}/${child}` : parent;
+}
+
+async function expandUploadFiles(
+	files,
+	extractionDirectory,
+	parentFolder = ""
+) {
+	const groups = [];
 	for (const file of files) {
-		const filePath = file.path;
-		const fileName = file.originalname || path.basename(filePath);
-		const buffer = fs.readFileSync(filePath);
+		if (isZipFile(file)) {
+			const zipRootFolder = joinUploadFolder(
+				parentFolder,
+				zipFolderName(file)
+			);
+			const extractedFiles = await extractZipImages(
+				file,
+				extractionDirectory
+			);
+			const groupsByFolder = new Map();
+			for (const extractedFile of extractedFiles) {
+				const uploadFolder = appendUploadFolder(
+					zipRootFolder,
+					extractedFile.relativeFolder
+				);
+				const group = groupsByFolder.get(uploadFolder) || {
+					files: [],
+					folder: uploadFolder,
+					rootFolder: zipRootFolder,
+				};
+				group.files.push(extractedFile);
+				groupsByFolder.set(uploadFolder, group);
+			}
+			groups.push(...groupsByFolder.values());
+		} else {
+			groups.push({
+				files: [
+					{
+						...file,
+						size: await getFileSize(file),
+					},
+				],
+				folder: parentFolder,
+				rootFolder: parentFolder,
+			});
+		}
+	}
+	return groups;
+}
+
+function splitUploadBatches(files) {
+	return files.map((file) => {
+		const fileSize = Number(file.size) || 0;
+		if (fileSize > MAX_UPLOAD_BATCH_BYTES) {
+			const err = new Error(
+				`"${file.originalname || "File"}" is too large for the asset library upload limit`
+			);
+			err.statusCode = 413;
+			throw err;
+		}
+		// Mindshare accepts the multipart request but processes only the first
+		// `files` part. Keep one extracted image per request so ZIP uploads do
+		// not silently lose every image after the first one.
+		return [file];
+	});
+}
+
+async function uploadFileBatch(advId, files, folderPath) {
+	const form = new FormData();
+	if (folderPath) {
+		// Support both folder naming conventions used by the asset-library API.
+		form.append("folder", folderPath);
+		form.append("path", folderPath);
+	}
+
+	for (const file of files) {
+		const buffer = await fs.promises.readFile(file.path);
 		const blob = new Blob([buffer], {
 			type: file.mimetype || "application/octet-stream",
 		});
-		form.append("file", blob, fileName);
-		form.append("files", blob, fileName);
+		// Send each upload once. Adding both `file` and `files` duplicated the
+		// payload and could push a valid request over Mindshare's 10 MB limit.
+		form.append("files", blob, file.originalname || path.basename(file.path));
 	}
 
+	const query = folderPath
+		? `?folder=${encodeURIComponent(folderPath)}&path=${encodeURIComponent(
+				folderPath
+		  )}`
+		: "";
 	const response = await fetch(
-		`${getBaseUrl()}/v2/accounts/${advId}/asset-library`,
+		`${getBaseUrl()}/v2/accounts/${advId}/asset-library${query}`,
 		{
 			method: "POST",
 			headers: buildAuthHeaders(),
@@ -216,19 +466,84 @@ async function uploadAssetsToAccount(accountId, files = []) {
 				payload?.error ||
 				`Mindshare upload failed (${response.status})`
 		);
-		err.statusCode = response.status >= 400 && response.status < 600
-			? response.status
-			: 502;
+		err.statusCode =
+			response.status >= 400 && response.status < 600
+				? response.status
+				: 502;
 		err.data = payload;
 		throw err;
 	}
-
 	return {
-		accountAdvId: advId,
-		uploaded: files.length,
+		payload,
 		assets: normalizeAssetList(payload),
-		raw: payload,
 	};
+}
+
+async function uploadAssetsToAccount(accountId, files = [], folder = "") {
+	const advId = await resolveAccountAdvId(accountId);
+	if (!Array.isArray(files) || files.length === 0) {
+		const err = new Error("At least one image or zip file is required");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	const extractionDirectory = await fs.promises.mkdtemp(
+		path.join(os.tmpdir(), "jasm-asset-upload-")
+	);
+	try {
+		const requestedFolder = String(folder || "").trim();
+		const uploadGroups = await expandUploadFiles(
+			files,
+			extractionDirectory,
+			requestedFolder
+		);
+		const uploadFiles = uploadGroups.flatMap((group) => group.files);
+		const batchResults = [];
+
+		for (const group of uploadGroups) {
+			const batches = splitUploadBatches(group.files);
+			for (const batch of batches) {
+				batchResults.push(
+					await uploadFileBatch(advId, batch, group.folder)
+				);
+			}
+		}
+		clearUpdateImagesAssetIndexCache(accountId);
+		const rootFolderPaths = [
+			...new Set(
+				uploadGroups
+					.map((group) => group.rootFolder || group.folder)
+					.filter(Boolean)
+			),
+		];
+
+		return {
+			accountAdvId: advId,
+			folder:
+				rootFolderPaths.length === 1
+					? rootFolderPaths[0]
+					: requestedFolder,
+			uploaded: uploadFiles.length,
+			uploadedFiles: uploadGroups.flatMap((group) =>
+				group.files.map((file) => ({
+					originalname: file.originalname,
+					mimetype: file.mimetype,
+					size: file.size,
+					folder: group.folder,
+				}))
+			),
+			assets: batchResults.flatMap((result) => result.assets),
+			raw:
+				batchResults.length === 1
+					? batchResults[0].payload
+					: batchResults.map((result) => result.payload),
+		};
+	} finally {
+		await fs.promises.rm(extractionDirectory, {
+			recursive: true,
+			force: true,
+		});
+	}
 }
 
 function pickFirstUploadedCdnUrl(uploadResult) {
@@ -443,29 +758,33 @@ async function listAccountAssets(
 	const advId = await resolveAccountAdvId(accountId);
 	const assets = [];
 	const folders = [];
+	const folderSet = new Set();
 	const visited = new Set();
+	const queued = new Set();
 	const folderPrefix = String(folder || "")
 		.trim()
 		.replace(/^\/+|\/+$/g, "");
 	const queue = [folderPrefix ? `${folderPrefix}/` : ""];
+	queued.add(queue[0]);
 	let pages = 0;
+	const maxPages = 200;
+	const concurrency = 8;
 
-	while (queue.length && pages < 200) {
-		const prefix = queue.shift();
-		const visitKey = prefix || "__root__";
-		if (visited.has(visitKey)) continue;
-		visited.add(visitKey);
-
+	const readPrefix = async (prefix) => {
+		const prefixAssets = [];
+		const childPrefixes = [];
 		let nextKey = null;
+
 		do {
+			if (pages >= maxPages) break;
+			pages += 1;
 			const payload = await fetchAssetLibraryPage(advId, {
 				prefix,
 				nextKey,
 			});
-			pages += 1;
 
 			for (const file of normalizeAssetList(payload)) {
-				if (isRealAssetFile(file)) assets.push(file);
+				if (isRealAssetFile(file)) prefixAssets.push(file);
 			}
 
 			if (recursive) {
@@ -475,20 +794,44 @@ async function listAccountAssets(
 					if (excludeAem && isAemFolderName(folderName)) continue;
 					const childPrefix = joinFolderPrefix(prefix, folderName);
 					const childPath = childPrefix.replace(/\/+$/, "");
-					if (childPath && !folders.includes(childPath)) {
+					if (childPath && !folderSet.has(childPath)) {
+						folderSet.add(childPath);
 						folders.push(childPath);
 					}
 					if (excludeAem && isAemFolderName(childPrefix.split("/")[0])) {
 						continue;
 					}
-					if (childPrefix && !visited.has(childPrefix)) {
-						queue.push(childPrefix);
-					}
+					if (childPrefix) childPrefixes.push(childPrefix);
 				}
 			}
 
 			nextKey = payload?.nextKey || null;
-		} while (nextKey && pages < 200);
+		} while (nextKey && pages < maxPages);
+
+		return { prefixAssets, childPrefixes };
+	};
+
+	while (queue.length && pages < maxPages) {
+		const batch = [];
+		while (queue.length && batch.length < concurrency) {
+			const prefix = queue.shift();
+			const visitKey = prefix || "__root__";
+			if (visited.has(visitKey)) continue;
+			visited.add(visitKey);
+			batch.push(prefix);
+		}
+
+		const results = await Promise.all(batch.map(readPrefix));
+		for (const result of results) {
+			assets.push(...result.prefixAssets);
+			if (!recursive) continue;
+			for (const childPrefix of result.childPrefixes) {
+				if (!visited.has(childPrefix) && !queued.has(childPrefix)) {
+					queued.add(childPrefix);
+					queue.push(childPrefix);
+				}
+			}
+		}
 	}
 
 	return {
@@ -508,35 +851,61 @@ async function listAccountAssets(
  */
 async function buildUpdateImagesAssetIndex(accountId, folder = "") {
 	const folderPath = String(folder || "").trim();
+	const cacheKey = `${String(accountId)}:${folderPath}`;
+	const now = Date.now();
+	const cached = updateImagesIndexCache.get(cacheKey);
+	if (cached && cached.expiresAt > now) {
+		return cached.promise;
+	}
 
-	if (folderPath) {
+	const promise = (async () => {
+		if (folderPath) {
+			const { assets } = await listAccountAssets(accountId, {
+				folder: folderPath,
+				recursive: true,
+				excludeAem: false,
+			});
+			return {
+				index: buildAssetUrlIndex(assets),
+				librarySize: assets.length,
+				folder: folderPath,
+				scope: "folder",
+			};
+		}
+
+		// All folders: BFS visits root files first, then each folder —
+		// first-wins in buildAssetUrlIndex keeps outside-folder URLs as
+		// priority.
 		const { assets } = await listAccountAssets(accountId, {
-			folder: folderPath,
+			folder: "",
 			recursive: true,
-			excludeAem: false,
+			excludeAem: true,
 		});
+
 		return {
 			index: buildAssetUrlIndex(assets),
 			librarySize: assets.length,
-			folder: folderPath,
-			scope: "folder",
+			folder: null,
+			scope: "all",
 		};
-	}
-
-	// All folders: BFS visits root files first, then each folder — first-wins
-	// in buildAssetUrlIndex keeps outside-folder URLs as priority.
-	const { assets } = await listAccountAssets(accountId, {
-		folder: "",
-		recursive: true,
-		excludeAem: true,
+	})();
+	updateImagesIndexCache.set(cacheKey, {
+		expiresAt: now + UPDATE_IMAGES_INDEX_CACHE_TTL_MS,
+		promise,
 	});
+	try {
+		return await promise;
+	} catch (error) {
+		updateImagesIndexCache.delete(cacheKey);
+		throw error;
+	}
+}
 
-	return {
-		index: buildAssetUrlIndex(assets),
-		librarySize: assets.length,
-		folder: null,
-		scope: "all",
-	};
+function clearUpdateImagesAssetIndexCache(accountId) {
+	const prefix = `${String(accountId)}:`;
+	for (const key of updateImagesIndexCache.keys()) {
+		if (key.startsWith(prefix)) updateImagesIndexCache.delete(key);
+	}
 }
 
 /**
@@ -616,43 +985,127 @@ async function listAccountFolders(accountId) {
 function buildAssetUrlIndex(assets = []) {
 	const byName = new Map();
 	const byBaseName = new Map();
+	const byPathParts = new Map();
+	const paths = [];
+	const normalizeAssetPath = (value) => {
+		let normalized = String(value || "").trim().replace(/\\/g, "/");
+		try {
+			normalized = decodeURIComponent(normalized);
+		} catch {
+			// Keep the original path when it contains malformed encoding.
+		}
+		return normalized
+			.replace(/\s*\/\s*/g, "/")
+			.replace(/^\/+|\/+$/g, "")
+			.toLowerCase();
+	};
+	const pathCandidates = (value) => {
+		const normalized = normalizeAssetPath(value);
+		if (!normalized) return [];
+		const parts = normalized.split("/").filter(Boolean);
+		return parts.map((_part, index) => parts.slice(index).join("/"));
+	};
 
 	for (const asset of normalizeAssetList(assets)) {
 		if (!isRealAssetFile(asset)) continue;
 		const url = pickAssetUrl(asset);
 		const name = pickAssetName(asset);
-		let urlName = "";
-		try {
-			urlName = path.basename(new URL(url).pathname);
-		} catch {
-			urlName = path.basename(url);
-		}
+		const candidates = [
+			...pathCandidates(name),
+			...(() => {
+				try {
+					return pathCandidates(new URL(url).pathname);
+				} catch {
+					return pathCandidates(url);
+				}
+			})(),
+		];
 
-		for (const candidate of [name, urlName]) {
-			const key = String(candidate || "")
-				.trim()
-				.toLowerCase();
+		for (const candidate of new Set(candidates)) {
+			const key = normalizeAssetPath(candidate);
 			if (!key || key === ".dir") continue;
 			if (!byName.has(key)) byName.set(key, url);
+			if (key.includes("/")) {
+				paths.push({ key, url });
+				const parts = key.split("/").filter(Boolean);
+				const fileName = parts[parts.length - 1];
+				const fileBaseName = stripExtension(fileName);
+				for (const folderPart of parts.slice(0, -1)) {
+					const partKey = `${folderPart}/${fileName}`;
+					const basePartKey = `${folderPart}/${fileBaseName}`;
+					if (!byPathParts.has(partKey)) {
+						byPathParts.set(partKey, url);
+					}
+					if (!byPathParts.has(basePartKey)) {
+						byPathParts.set(basePartKey, url);
+					}
+				}
+			}
 			const base = stripExtension(key).toLowerCase();
 			if (base && !byBaseName.has(base)) byBaseName.set(base, url);
 		}
 	}
 
-	return { byName, byBaseName };
+	return { byName, byBaseName, byPathParts, paths };
 }
 
 function resolveAssetUrlByName(index, assetName) {
-	const needle = String(assetName || "").trim();
+	const needle = String(assetName || "")
+		.trim()
+		.replace(/\\/g, "/")
+		.replace(/\s*\/\s*/g, "/");
 	if (!needle || !index) return "";
-	const key = needle.toLowerCase();
+	const key = needle.replace(/^\/+|\/+$/g, "").toLowerCase();
 	if (index.byName.has(key)) return index.byName.get(key);
 	const base = stripExtension(key).toLowerCase();
 	if (base && index.byBaseName.has(base)) return index.byBaseName.get(base);
 	// Cell has "Reset.png" but index only keyed "reset"
 	if (base && index.byName.has(base)) return index.byName.get(base);
-	// Cell may include a folder path: "Images/foo.png"
-	const bare = path.basename(needle);
+	if (index.byPathParts?.has(key)) return index.byPathParts.get(key);
+	if (base && index.byPathParts?.has(base)) {
+		return index.byPathParts.get(base);
+	}
+	// A target column can identify a folder/frame while the reference cell
+	// contains only the filename (for example, `BG1` + `image1`). Allow the
+	// requested path parts to appear in order with frame folders between them.
+	if (key.includes("/") && Array.isArray(index.paths)) {
+		const needleParts = key.split("/").filter(Boolean);
+		let bestMatch = null;
+		let bestScore = -Infinity;
+		for (const entry of index.paths) {
+			const assetParts = entry.key.split("/").filter(Boolean);
+			let needleIndex = 0;
+			for (let assetIndex = 0; assetIndex < assetParts.length; assetIndex += 1) {
+				const assetPart = assetParts[assetIndex];
+				const comparableAssetPart =
+					assetIndex === assetParts.length - 1
+						? stripExtension(assetPart)
+						: assetPart;
+				if (comparableAssetPart === needleParts[needleIndex]) {
+					needleIndex += 1;
+					if (needleIndex === needleParts.length) break;
+				}
+			}
+			if (needleIndex !== needleParts.length) continue;
+			const score =
+				needleParts.length * 100 -
+				(assetParts.length - needleParts.length);
+			if (score > bestScore) {
+				bestScore = score;
+				bestMatch = entry.url;
+			}
+		}
+		if (bestMatch) return bestMatch;
+	}
+	// A frame path may be present in the cell. Only fall back to its
+	// basename after trying the complete path and every normalized suffix.
+	const pathParts = key.split("/").filter(Boolean);
+	for (let indexInPath = 1; indexInPath < pathParts.length; indexInPath += 1) {
+		const suffix = pathParts.slice(indexInPath).join("/");
+		const suffixUrl = resolveAssetUrlByName(index, suffix);
+		if (suffixUrl) return suffixUrl;
+	}
+	const bare = path.posix.basename(needle);
 	if (bare && bare.toLowerCase() !== key) {
 		return resolveAssetUrlByName(index, bare);
 	}

@@ -38,6 +38,19 @@ const AssetUploadSchema = new mongoose.Schema(
 			type: String,
 			required: true,
 		},
+		generatedGoogleSheetId: {
+			type: String,
+			default: "",
+		},
+		generatedGoogleSheetUrl: {
+			type: String,
+			default: "",
+		},
+		generatedGoogleSheetAuthType: {
+			type: String,
+			enum: ["oauth", "service-account", ""],
+			default: "",
+		},
 		storageType: {
 			type: String,
 			enum: ["local", "s3"],

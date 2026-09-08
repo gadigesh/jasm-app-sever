@@ -59,6 +59,12 @@ const {
 	getDeletedAssetSourceNames,
 } = require("../utils/nameValidation");
 const { formatApiError } = require("../utils/apiErrors");
+const {
+	buildRowFilter,
+	buildRowSort,
+	normalizeFilterValue,
+	sortFilterValues,
+} = require("../utils/rowFilters");
 
 const copyMatrixRouter = express.Router();
 
@@ -757,6 +763,59 @@ copyMatrixRouter.get(
 );
 
 copyMatrixRouter.get(
+	"/copy-matrix/:id/rows/values",
+	userAuth,
+	async (req, res) => {
+		try {
+			const matrix = await CopyMatrix.findById(req.params.id).select(
+				"columns"
+			);
+			if (!matrix) {
+				return res
+					.status(404)
+					.json({ message: "Copy matrix not found" });
+			}
+
+			const column = String(req.query.column || "").trim();
+			const columns = ensureRowIdColumn(matrix.columns || []);
+			if (!column || !columns.includes(column)) {
+				return res.status(400).json({
+					message: "A valid column is required",
+				});
+			}
+
+			const filter = { copyMatrixId: matrix._id };
+			let values;
+			if (column === AUTO_ROW_ID_COLUMN) {
+				values = await CopyMatrixRow.distinct("rowIndex", filter);
+			} else {
+				values = await CopyMatrixRow.distinct(
+					`rowData.${column}`,
+					filter
+				);
+			}
+
+			const normalizedValues = sortFilterValues(
+				values.map(normalizeFilterValue)
+			);
+
+			return res.status(200).json({
+				message: "Column values fetched successfully",
+				data: {
+					column,
+					values: normalizedValues,
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			return res
+				.status(500)
+				.json({ message: "Failed to fetch column values" });
+		}
+	}
+);
+
+copyMatrixRouter.get(
 	"/copy-matrix/:id/rows",
 	userAuth,
 	async (req, res) => {
@@ -775,19 +834,34 @@ copyMatrixRouter.get(
 					.json({ message: "Copy matrix not found" });
 			}
 
+			const columns = ensureRowIdColumn(matrix.columns || []);
+			const filter = buildRowFilter(
+				{ copyMatrixId: matrix._id },
+				req.query.filters,
+				columns,
+				AUTO_ROW_ID_COLUMN
+			);
+			const sort = buildRowSort(
+				String(req.query.sortColumn || "").trim(),
+				req.query.sortDirection,
+				columns,
+				AUTO_ROW_ID_COLUMN,
+				{ rowIndex: 1 }
+			);
+
 			const [rows, total] = await Promise.all([
-				CopyMatrixRow.find({ copyMatrixId: matrix._id })
-					.sort({ rowIndex: 1 })
+				CopyMatrixRow.find(filter)
+					.sort(sort)
 					.skip(skip)
 					.limit(limit)
 					.lean(),
-				CopyMatrixRow.countDocuments({ copyMatrixId: matrix._id }),
+				CopyMatrixRow.countDocuments(filter),
 			]);
 
 			res.status(200).json({
 				message: "Rows fetched successfully",
 				data: {
-					columns: ensureRowIdColumn(matrix.columns || []),
+					columns,
 					rows: rows.map((row) => ({
 						_id: row._id,
 						rowIndex: row.rowIndex,
@@ -1471,14 +1545,15 @@ copyMatrixRouter.post(
 					.json({ message: "Copy matrix not found" });
 			}
 
-			const result = await uploadAssetsToAccount(
-				matrix.accountId,
-				tempFiles
-			);
-
 			const folder = String(
 				req.body?.folder || req.query?.folder || ""
 			).trim();
+			const result = await uploadAssetsToAccount(
+				matrix.accountId,
+				tempFiles,
+				folder
+			);
+
 			const targetColumn = String(
 				req.body?.targetColumn || req.query?.targetColumn || ""
 			).trim();
@@ -1495,8 +1570,8 @@ copyMatrixRouter.post(
 			const cdnUrl = await resolveUploadedCdnUrl(
 				matrix.accountId,
 				result,
-				tempFiles,
-				folder
+				result.uploadedFiles || tempFiles,
+				result.folder || folder
 			);
 
 			let applied = null;
@@ -1604,6 +1679,7 @@ copyMatrixRouter.post(
 				rowIds,
 				dryRun,
 				rowSnapshots,
+				rowOverrides,
 			} = req.body;
 			const matrix = await CopyMatrix.findById(req.params.id);
 			if (!matrix) {
@@ -1620,7 +1696,7 @@ copyMatrixRouter.post(
 				req.user._id,
 				template,
 				folder,
-				{ dryRun, rowSnapshots }
+				{ dryRun, rowSnapshots, rowOverrides }
 			);
 
 			res.status(200).json({

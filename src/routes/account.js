@@ -13,11 +13,32 @@ const normalize = (value) => value.trim().toLowerCase();
 const ACCOUNT_ASSET_CACHE_TTL_MS = 60 * 1000;
 const accountAssetCache = new Map();
 
-async function getAccountAssets(accountId, folder) {
+function assetTimestamp(asset) {
+	const candidates = [
+		asset?.createdAt,
+		asset?.uploadedAt,
+		asset?.updatedAt,
+		asset?.modifiedAt,
+		asset?.lastModified,
+		asset?.date,
+		asset?.metadata?.createdAt,
+		asset?.metadata?.updatedAt,
+	];
+	for (const value of candidates) {
+		if (typeof value === "number" && Number.isFinite(value)) {
+			return value;
+		}
+		const parsed = Date.parse(String(value || ""));
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return 0;
+}
+
+async function getAccountAssets(accountId, folder, { forceRefresh = false } = {}) {
 	const key = `${String(accountId)}:${String(folder || "").trim()}`;
 	const now = Date.now();
 	const cached = accountAssetCache.get(key);
-	if (cached && cached.expiresAt > now) {
+	if (!forceRefresh && cached && cached.expiresAt > now) {
 		return cached.promise;
 	}
 
@@ -157,7 +178,11 @@ accountRouter.get(
 			}
 			// Share the same cached recursive library walk used by file preview.
 			// This avoids loading every Mindshare folder twice.
-			const result = await getAccountAssets(account._id, "");
+			// Uploads can create a new folder. Bypass the short-lived account
+			// cache so the folder dropdown reflects it immediately.
+			const result = await getAccountAssets(account._id, "", {
+				forceRefresh: true,
+			});
 			res.status(200).json({
 				message: "Folders fetched",
 				data: {
@@ -193,11 +218,16 @@ accountRouter.get(
 			);
 			const folder = String(req.query.folder || "").trim();
 			const search = String(req.query.search || "").trim().toLowerCase();
-			const result = await getAccountAssets(account._id, folder);
+			const forceRefresh = ["1", "true", "yes"].includes(
+				String(req.query.refresh || "").toLowerCase()
+			);
+			const result = await getAccountAssets(account._id, folder, {
+				forceRefresh,
+			});
 
 			const seen = new Set();
 			const files = result.assets
-				.map((asset) => ({
+				.map((asset, sourceIndex) => ({
 					name: pickAssetName(asset),
 					url: pickAssetUrl(asset),
 					mimeType:
@@ -205,16 +235,20 @@ accountRouter.get(
 						asset?.contentType ||
 						asset?.type ||
 						"",
+					assetTime: assetTimestamp(asset),
+					sourceIndex,
 				}))
 				.filter((asset) => {
 					if (!asset.url || seen.has(asset.url)) return false;
 					seen.add(asset.url);
 					return true;
 				})
-				.map(({ name, url, mimeType }) => ({
+				.map(({ name, url, mimeType, assetTime, sourceIndex }) => ({
 					name,
 					url,
 					mimeType: String(mimeType || ""),
+					assetTime,
+					sourceIndex,
 					isImage:
 						String(mimeType).toLowerCase().startsWith("image/") ||
 						/\.(?:avif|bmp|gif|jpe?g|png|svg|webp)(?:[?#].*)?$/i.test(
@@ -228,9 +262,12 @@ accountRouter.get(
 						String(value || "").toLowerCase().includes(search)
 					);
 				})
-				.sort((left, right) =>
-					String(left.name || "").localeCompare(String(right.name || ""))
-				);
+				.sort(
+					(left, right) =>
+						right.assetTime - left.assetTime ||
+						left.sourceIndex - right.sourceIndex
+				)
+				.map(({ assetTime, sourceIndex, ...asset }) => asset);
 
 			const total = files.length;
 			const totalPages = Math.max(1, Math.ceil(total / limit));

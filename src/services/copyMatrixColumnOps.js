@@ -558,6 +558,9 @@ async function updateColumnImages(
 	const rowSnapshots = Array.isArray(options.rowSnapshots)
 		? options.rowSnapshots
 		: null;
+	const rowOverrides = Array.isArray(options.rowOverrides)
+		? options.rowOverrides
+		: null;
 
 	assertColumnExists(matrix, targetColumn);
 	assertEditableDataColumn(targetColumn);
@@ -588,6 +591,23 @@ async function updateColumnImages(
 		}));
 	} else {
 		rows = await loadTargetRows(matrix._id, rowIds);
+	}
+
+	if (rowOverrides?.length) {
+		const overridesById = new Map(
+			rowOverrides.map((row) => [
+				String(row._id || row.rowId),
+				row.rowData && typeof row.rowData === "object"
+					? row.rowData
+					: {},
+			])
+		);
+		for (const row of rows) {
+			const override = overridesById.get(String(row._id));
+			if (override) {
+				row.rowData = { ...(row.rowData || {}), ...override };
+			}
+		}
 	}
 
 	if (!rows.length) {
