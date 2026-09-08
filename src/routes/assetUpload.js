@@ -59,6 +59,7 @@ const {
 	buildRowFilter,
 	buildRowSort,
 	normalizeFilterValue,
+	omitColumnFromFilters,
 	sortFilterValues,
 } = require("../utils/rowFilters");
 
@@ -1362,13 +1363,15 @@ assetRouter.get("/source/:id/rows/values", userAuth, async (req, res) => {
 			});
 		}
 
-		const values = await AssetSource.distinct(
-			`rowData.${column}`,
-			{
-				uploadId: upload._id,
-				isDeleted: false,
-			}
+		const filter = buildRowFilter(
+			{ uploadId: upload._id, isDeleted: false },
+			omitColumnFromFilters(req.query.filters, column),
+			columns,
+			AUTO_ROW_ID_COLUMN
 		);
+		const valuePath =
+			column === AUTO_ROW_ID_COLUMN ? "cmRowIndex" : `rowData.${column}`;
+		const values = await AssetSource.distinct(valuePath, filter);
 
 		return res.status(200).json({
 			message: "Column values fetched successfully",

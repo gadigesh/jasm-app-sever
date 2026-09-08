@@ -36,6 +36,14 @@ function parseColumnFilters(rawFilters) {
 	);
 }
 
+function omitColumnFromFilters(rawFilters, excludeColumn) {
+	const filters = parseColumnFilters(rawFilters);
+	if (excludeColumn) {
+		delete filters[excludeColumn];
+	}
+	return filters;
+}
+
 function buildRowFilter(
 	baseFilter,
 	rawFilters,
@@ -120,6 +128,7 @@ module.exports = {
 	buildRowFilter,
 	buildRowSort,
 	normalizeFilterValue,
+	omitColumnFromFilters,
 	parseColumnFilters,
 	sortFilterValues,
 };

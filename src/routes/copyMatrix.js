@@ -63,6 +63,7 @@ const {
 	buildRowFilter,
 	buildRowSort,
 	normalizeFilterValue,
+	omitColumnFromFilters,
 	sortFilterValues,
 } = require("../utils/rowFilters");
 
@@ -784,7 +785,12 @@ copyMatrixRouter.get(
 				});
 			}
 
-			const filter = { copyMatrixId: matrix._id };
+			const filter = buildRowFilter(
+				{ copyMatrixId: matrix._id },
+				omitColumnFromFilters(req.query.filters, column),
+				columns,
+				AUTO_ROW_ID_COLUMN
+			);
 			let values;
 			if (column === AUTO_ROW_ID_COLUMN) {
 				values = await CopyMatrixRow.distinct("rowIndex", filter);

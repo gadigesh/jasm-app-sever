@@ -13,7 +13,7 @@ const userAuth = async (req, res, next) => {
 		}
 
 		if (!token) {
-			return res.status(401).send("Access Denied: Please Login");
+			return res.status(401).json({ message: "Access Denied: Please Login" });
 		}
 
 		// 🟢 2. CHECK SYSTEM KEY FIRST (CRITICAL FIX)
@@ -44,8 +44,7 @@ const userAuth = async (req, res, next) => {
 		next();
 	} catch (error) {
 		// This is where "jwt malformed" was coming from
-		console.error("Auth Error:", error.message);
-		res.status(401).send("Error: " + error.message);
+		res.status(401).json({ message: error.message || "Please login" });
 	}
 };
 
