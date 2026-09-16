@@ -44,37 +44,20 @@ authRouter.post("/signup", async (req, res) => {
 		const { firstName, lastName, emailId, password, photoUrl } = req.body;
 		const passwordHash = await bcrypt.hash(password, 10);
 
-		// 1️⃣ Find or create default account FIRST
-		let account = await Account.findOne({
-			clientName: "Jivox",
-			accountName: "Demo",
-		});
-
-		if (!account) {
-			account = await Account.create({
-				clientName: "Jivox",
-				accountName: "Demo",
-				accountStatus: "Active",
-			});
-		}
-
-		// 2️⃣ Create user WITH correct activeAccountId
 		const user = new User({
 			firstName,
 			lastName,
 			emailId,
 			password: passwordHash,
 			photoUrl,
-			activeAccountId: account._id, // ✅ CORRECT
+			activeAccountId: null,
 		});
 
 		const saveUser = await user.save();
-		const token = await saveUser.getJWT();
-
-		res.cookie("token", token, authCookieOptions);
 
 		res.json({
 			message: "User added successfully",
+			emailId: saveUser.emailId,
 		});
 	} catch (err) {
 		res.status(401).json({ message: err.message });

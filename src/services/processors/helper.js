@@ -21,6 +21,20 @@ function getExcelCellValue(cellValue) {
 	return JSON.stringify(cellValue);
 }
 
+const {
+	AUTO_ROW_ID_COLUMN,
+	isAutoRowIdColumn,
+} = require("../../constants/copyMatrix");
+
+function assignRowKey(rowData, uniqueKey, rowNumber) {
+	if (isAutoRowIdColumn(uniqueKey)) {
+		const key = String(rowNumber);
+		rowData[AUTO_ROW_ID_COLUMN] = key;
+		return key;
+	}
+	return String(rowData[uniqueKey] ?? "").trim();
+}
+
 function getDiff(oldObj, newObj, uniqueKey) {
 	const changes = [];
 	for (const key in newObj) {
@@ -35,4 +49,4 @@ function getDiff(oldObj, newObj, uniqueKey) {
 	return changes;
 }
 
-module.exports = { getExcelCellValue, getDiff };
+module.exports = { assignRowKey, getExcelCellValue, getDiff };

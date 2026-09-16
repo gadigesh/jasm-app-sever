@@ -1,6 +1,8 @@
 const csv = require("csv-parser");
 const storageService = require("../../storage");
 const { processBatch } = require("../batchLogic");
+const { assignRowKey } = require("../helper");
+const { isAutoRowIdColumn } = require("../../../constants/copyMatrix");
 const {
 	rowArrayFromRecord,
 	buildHeadersFromHeaderRow,
@@ -41,10 +43,10 @@ async function processStreamCSV(uploadDoc, uniqueKey, seenKeys, fileHash, userId
 		rowIndex++;
 		const { rowData: cleanRow } = rowDataFromArray(rowArr, headers);
 
-		const keyVal = cleanRow[uniqueKey];
+		const keyVal = assignRowKey(cleanRow, uniqueKey, rowIndex - 1);
 
 		// 🛑 VALIDATION: Missing Key
-		if (!keyVal) {
+		if (!keyVal && !isAutoRowIdColumn(uniqueKey)) {
 			if (validationErrors.length < MAX_VALIDATION_ERRORS) {
 				validationErrors.push({
 					row: rowIndex,
@@ -56,7 +58,7 @@ async function processStreamCSV(uploadDoc, uniqueKey, seenKeys, fileHash, userId
 		}
 
 		// 🛑 VALIDATION: Duplicate in File
-		if (seenKeys.has(keyVal)) {
+		if (!isAutoRowIdColumn(uniqueKey) && seenKeys.has(keyVal)) {
 			if (validationErrors.length < MAX_VALIDATION_ERRORS) {
 				validationErrors.push({
 					row: rowIndex,

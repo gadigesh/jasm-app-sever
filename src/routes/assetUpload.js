@@ -27,6 +27,8 @@ const {
 const { formatApiError } = require("../utils/apiErrors");
 const {
 	AUTO_ROW_ID_COLUMN,
+	ensureRowIdColumn,
+	omitRowIdColumn,
 	isAutoRowIdColumn,
 	normalizeRowDataValues,
 	normalizeCellText,
@@ -62,6 +64,12 @@ const {
 	omitColumnFromFilters,
 	sortFilterValues,
 } = require("../utils/rowFilters");
+const {
+	getAddedRowCountsByUpload,
+	previewAssetSourceRefresh,
+	applyAssetSourceRefresh,
+	resolveLinkedMatrixIdsByUpload,
+} = require("../services/assetSourceRefresh");
 
 const assetRouter = express.Router();
 
@@ -423,6 +431,12 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 			}
 		}
 
+		const linkedMatrixIds = await resolveLinkedMatrixIdsByUpload(assets);
+		const addedRowCounts = await getAddedRowCountsByUpload(
+			assets,
+			linkedMatrixIds
+		);
+
 		const formattedData = assets.map((asset) => {
 			const userName = asset.uploadedBy
 				? asset.uploadedBy.firstName
@@ -449,6 +463,18 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 			addMatrix(matricesByUploadId.get(String(asset._id)));
 
 			const mappedCopyMatrix = mappedCopyMatrices[0] || null;
+			const linkedMatrixId =
+				linkedMatrixIds.get(String(asset._id)) ||
+				mappedCopyMatrix?.id ||
+				null;
+			const canRefresh = Boolean(linkedMatrixId);
+			const changeCounts = addedRowCounts.get(String(asset._id)) || {
+				added: 0,
+				modified: 0,
+				removed: 0,
+				newColumns: 0,
+				total: 0,
+			};
 
 			return {
 				_id: asset._id,
@@ -464,6 +490,12 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 					: null,
 				mappedCopyMatrix,
 				mappedCopyMatrices,
+				canRefresh,
+				addedRowCount: changeCounts.added,
+				modifiedRowCount: changeCounts.modified,
+				removedRowCount: changeCounts.removed,
+				newColumnCount: changeCounts.newColumns,
+				changedRowCount: changeCounts.total,
 			};
 		});
 
@@ -500,8 +532,7 @@ assetRouter.post(
 
 		try {
 			// 1. Extract Data from Frontend Form
-			const { accountId, assetName, uniqueColumn, inputType, fileRef } =
-				req.body;
+			const { accountId, assetName, inputType, fileRef } = req.body;
 			const isGSheet = inputType === "gsheet";
 
 			// 2. Validation
@@ -519,13 +550,6 @@ assetRouter.post(
 					.status(400)
 					.json({ message: "Account ID is required" });
 			}
-			if (!uniqueColumn) {
-				cleanup();
-				return res.status(400).json({
-					message: "Unique Column (Primary Key) is required",
-				});
-			}
-
 			let finalFileRef = isGSheet ? fileRef.trim() : "";
 			let fileHash = "";
 			let fileName = "";
@@ -576,7 +600,7 @@ assetRouter.post(
 			const newUpload = await AssetUpload.create({
 				accountId: accountId, // 🔗 LINK TO ACCOUNT
 				assetName: resolvedAssetName,
-				uniqueColumn: uniqueColumn.trim(), // 🔑 The column selected by user
+				uniqueColumn: AUTO_ROW_ID_COLUMN,
 				fileName,
 				inputType: inputType || "file",
 				fileType,
@@ -681,6 +705,7 @@ assetRouter.put(
 			assetUpload.fileRef = finalFileRef;
 			assetUpload.status = "pending";
 			assetUpload.fileHash = fileHash;
+			assetUpload.uniqueColumn = AUTO_ROW_ID_COLUMN;
 			assetUpload.uploadedBy = req.user._id;
 
 			await assetUpload.save();
@@ -818,12 +843,13 @@ assetRouter.get("/source/:id/export", userAuth, async (req, res) => {
 			.sort(sortOrder)
 			.lean();
 
-		const columns =
+		const columns = omitRowIdColumn(
 			upload.columns?.length > 0
 				? upload.columns
 				: rows[0]?.rowData
 				? Object.keys(rows[0].rowData)
-				: [];
+				: []
+		);
 
 		const dataRows = rows.map((row) => row.rowData || {});
 		const csv = buildCsv(columns, dataRows);
@@ -851,12 +877,13 @@ assetRouter.get("/source/:id/export/excel", userAuth, async (req, res) => {
 		})
 			.sort({ cmRowIndex: 1, primaryKey: 1 })
 			.lean();
-		const columns =
+		const columns = omitRowIdColumn(
 			upload.columns?.length > 0
 				? upload.columns
 				: rows[0]?.rowData
 					? Object.keys(rows[0].rowData)
-					: [];
+					: []
+		);
 
 		const workbook = new ExcelJS.Workbook();
 		const worksheet = workbook.addWorksheet("Asset Source");
@@ -1021,12 +1048,13 @@ assetRouter.post("/source/:id/google-sheet", userAuth, async (req, res) => {
 		})
 			.sort({ cmRowIndex: 1, primaryKey: 1 })
 			.lean();
-		const columns =
+		const columns = omitRowIdColumn(
 			upload.columns?.length > 0
 				? upload.columns
 				: rows[0]?.rowData
 					? Object.keys(rows[0].rowData)
-					: [];
+					: []
+		);
 		const values = [
 			columns,
 			...rows.map((row) =>
@@ -1281,7 +1309,7 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 			return res.status(404).json({ message: "Asset source not found" });
 		}
 
-		const columns =
+		const columns = ensureRowIdColumn(
 			upload.columns?.length > 0
 				? upload.columns
 				: await AssetSource.findOne({ uploadId: upload._id }).then(
@@ -1289,7 +1317,8 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 							row?.rowData
 								? Object.keys(row.rowData)
 								: []
-				  );
+				  )
+		);
 
 		let deletedAssetSourceNames = [];
 		let syncedColumns = [];
@@ -1339,6 +1368,56 @@ assetRouter.get("/source/:id", userAuth, async (req, res) => {
 	} catch (err) {
 		console.error(err);
 		res.status(500).json({ message: "Failed to fetch asset source" });
+	}
+});
+
+assetRouter.post("/source/:id/refresh", userAuth, async (req, res) => {
+	try {
+		const upload = await AssetUpload.findById(req.params.id);
+		if (!upload) {
+			return res.status(404).json({ message: "Asset source not found" });
+		}
+
+		const preview = await previewAssetSourceRefresh(upload);
+		res.status(200).json({
+			message: preview.hasChanges
+				? "Copy matrix updates are ready to review"
+				: "Asset source is already up to date",
+			data: preview,
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(err.statusCode || 500).json({
+			message: formatApiError(
+				err,
+				"Failed to refresh asset source from copy matrix"
+			),
+		});
+	}
+});
+
+assetRouter.post("/source/:id/refresh/apply", userAuth, async (req, res) => {
+	try {
+		const upload = await AssetUpload.findById(req.params.id);
+		if (!upload) {
+			return res.status(404).json({ message: "Asset source not found" });
+		}
+
+		const applied = await applyAssetSourceRefresh(upload, req.user._id);
+		res.status(200).json({
+			message: applied.hasChanges
+				? "Asset source updated from copy matrix"
+				: "Asset source is already up to date",
+			data: applied,
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(err.statusCode || 500).json({
+			message: formatApiError(
+				err,
+				"Failed to apply asset source refresh"
+			),
+		});
 	}
 });
 
@@ -1404,10 +1483,9 @@ assetRouter.get("/source/:id/rows", userAuth, async (req, res) => {
 			return res.status(404).json({ message: "Asset source not found" });
 		}
 
-		const columns =
-			upload.columns?.length > 0
-				? upload.columns
-				: [];
+		const columns = ensureRowIdColumn(
+			upload.columns?.length > 0 ? upload.columns : []
+		);
 		const filter = buildRowFilter(
 			{ uploadId: upload._id, isDeleted: false },
 			req.query.filters,
@@ -1432,19 +1510,25 @@ assetRouter.get("/source/:id/rows", userAuth, async (req, res) => {
 			columns.length > 0
 				? columns
 				: rows[0]?.rowData
-					? Object.keys(rows[0].rowData)
-					: [];
+					? ensureRowIdColumn(Object.keys(rows[0].rowData))
+					: [AUTO_ROW_ID_COLUMN];
 
 		res.status(200).json({
 			message: "Rows fetched successfully",
 			data: {
 				columns: responseColumns,
-				rows: rows.map((row, idx) => ({
-					_id: row._id,
-					rowIndex: row.cmRowIndex ?? skip + idx + 1,
-					primaryKey: row.primaryKey,
-					...normalizeRowDataValues(row.rowData || {}),
-				})),
+				rows: rows.map((row, idx) => {
+					const rowIndex = row.cmRowIndex ?? skip + idx + 1;
+					const rowData = normalizeRowDataValues(row.rowData || {});
+					return {
+						_id: row._id,
+						rowIndex,
+						primaryKey: row.primaryKey,
+						...rowData,
+						[AUTO_ROW_ID_COLUMN]:
+							rowData[AUTO_ROW_ID_COLUMN] || String(rowIndex),
+					};
+				}),
 				pagination: {
 					page,
 					limit,
@@ -1511,20 +1595,6 @@ assetRouter.put("/source/:id/rows", userAuth, async (req, res) => {
 			return res.status(404).json({ message: "Asset source not found" });
 		}
 
-		const keyColumn = upload.uniqueColumn;
-		const uniqueness = await analyzeAssetSourceUniqueness(
-			upload._id,
-			keyColumn || AUTO_ROW_ID_COLUMN,
-			rows
-		);
-		if (!uniqueness.unique) {
-			return res.status(409).json({
-				message: uniqueness.message,
-				code: "UNIQUE_COLUMN_INVALID",
-				data: uniqueness,
-			});
-		}
-
 		for (const item of rows) {
 			if (!item._id || !item.rowData) continue;
 
@@ -1537,18 +1607,6 @@ assetRouter.put("/source/:id/rows", userAuth, async (req, res) => {
 				normalizedRowData,
 				req.user._id
 			);
-			if (normalizedRowData[keyColumn] != null) {
-				await AssetSource.updateOne(
-					{ _id: asset._id },
-					{
-						$set: {
-							primaryKey: normalizeCellText(
-								normalizedRowData[keyColumn]
-							),
-						},
-					}
-				);
-			}
 		}
 
 		upload.uploadedBy = req.user._id;
@@ -1583,17 +1641,7 @@ assetRouter.post("/source/:id/finish", userAuth, async (req, res) => {
 				.status(400)
 				.json({ message: "Only draft asset sources can be finalized" });
 		}
-		const uniqueness = await analyzeAssetSourceUniqueness(
-			upload._id,
-			upload.uniqueColumn || AUTO_ROW_ID_COLUMN
-		);
-		if (!uniqueness.unique) {
-			return res.status(409).json({
-				message: uniqueness.message,
-				code: "UNIQUE_COLUMN_INVALID",
-				data: uniqueness,
-			});
-		}
+		upload.uniqueColumn = AUTO_ROW_ID_COLUMN;
 
 		if (assetName?.trim()) {
 			const trimmedName = assetName.trim();
@@ -1687,7 +1735,7 @@ assetRouter.post("/source/:id/clone", userAuth, async (req, res) => {
 				originalName: source.originalName,
 				inputType: source.inputType || "file",
 				fileType: source.fileType || "csv",
-				uniqueColumn: source.uniqueColumn,
+				uniqueColumn: AUTO_ROW_ID_COLUMN,
 				fileRef,
 				storageType: source.storageType || "local",
 				fileHash:

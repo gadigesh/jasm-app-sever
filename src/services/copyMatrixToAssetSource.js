@@ -5,9 +5,11 @@ const CopyMatrixRow = require("../models/copyMatrixRow");
 const {
 	AUTO_ROW_ID_COLUMN,
 	ensureRowIdColumn,
+	omitRowIdColumn,
 	injectRowIdIntoRowData,
 	resolveUniqueColumn,
 	isAutoRowIdColumn,
+	normalizeCellText,
 } = require("../constants/copyMatrix");
 
 const BATCH_SIZE = 500;
@@ -141,43 +143,12 @@ async function analyzeColumnUniqueness(
 	};
 }
 
-async function resolveUniqueColumnWithFallback(
-	copyMatrixId,
-	requestedColumn,
-	columns = []
-) {
-	const requested =
-		requestedColumn?.trim() ||
-		resolveUniqueColumn(null, columns) ||
-		AUTO_ROW_ID_COLUMN;
-
-	if (isAutoRowIdColumn(requested)) {
-		return {
-			keyColumn: AUTO_ROW_ID_COLUMN,
-			requestedColumn: requested,
-			notice: null,
-		};
-	}
-
-	const analysis = await analyzeColumnUniqueness(copyMatrixId, requested);
-	if (analysis.unique) {
-		return {
-			keyColumn: requested,
-			requestedColumn: requested,
-			notice: analysis.emptyWarning || null,
-		};
-	}
-
-	// Do not silently switch to Row ID — keep the CM selection and surface the error.
-	const err = new Error(
-		analysis.message ||
-			`"${requested}" has duplicate values. Fix them or pick another unique column.`
-	);
-	err.statusCode = 400;
-	err.code = "UNIQUE_COLUMN_DUPLICATES";
-	err.duplicates = analysis.duplicates;
-	err.emptyRowIndexes = analysis.emptyRowIndexes;
-	throw err;
+async function resolveUniqueColumnWithFallback() {
+	return {
+		keyColumn: AUTO_ROW_ID_COLUMN,
+		requestedColumn: AUTO_ROW_ID_COLUMN,
+		notice: null,
+	};
 }
 
 async function insertRowsFromCopyMatrix(
@@ -214,6 +185,10 @@ async function insertRowsFromCopyMatrix(
 				isDeleted: false,
 				importStatus,
 				cmRowIndex: row.rowIndex,
+				cmSourceData: snapshotCmSourceData(
+					rowData,
+					omitRowIdColumn(matrix.columns || [])
+				),
 			};
 		});
 
@@ -242,16 +217,7 @@ async function createAssetSourceFromCopyMatrix(
 	uniqueColumn,
 	assetName = null
 ) {
-	const requested =
-		uniqueColumn?.trim() ||
-		matrix.uniqueColumn?.trim() ||
-		null;
-
-	const { keyColumn, notice } = await resolveUniqueColumnWithFallback(
-		matrix._id,
-		requested,
-		matrix.columns || []
-	);
+	const { keyColumn, notice } = await resolveUniqueColumnWithFallback();
 
 	// Persist the chosen unique column on the copy matrix as well
 	matrix.uniqueColumn = keyColumn;
@@ -346,43 +312,208 @@ async function resolveLinkedAssetUpload(matrix) {
 	return upload;
 }
 
-async function syncAssetSourceFromCopyMatrix(
-	matrixId,
-	userId = null,
-	uniqueColumn = null
-) {
-	const matrix = await CopyMatrix.findById(matrixId);
-	if (!matrix) return null;
+function snapshotCmSourceData(cmRowData, columns = []) {
+	const snap = {};
+	for (const column of columns) {
+		snap[column] = cmRowData?.[column] ?? "";
+	}
+	return snap;
+}
 
-	const upload = await resolveLinkedAssetUpload(matrix);
-	if (!upload) return null;
-
-	const fullUpload = await AssetUpload.findById(upload._id);
-	if (!fullUpload) return null;
-
-	const { keyColumn, notice } = await resolveUniqueColumnWithFallback(
-		matrixId,
-		uniqueColumn || matrix.uniqueColumn || fullUpload.uniqueColumn,
-		matrix.columns || []
+function copyMatrixCellChanged(snapshot, cmRowData, column) {
+	if (!snapshot || typeof snapshot !== "object") return false;
+	return (
+		normalizeCellText(snapshot?.[column]) !==
+		normalizeCellText(cmRowData?.[column])
 	);
+}
+
+function parseCopyMatrixIdFromUpload(upload) {
+	if (upload?.copyMatrixId) return String(upload.copyMatrixId);
+	const match = String(upload?.fileRef || "").match(/^copy-matrix:\/\/(.+)$/);
+	return match?.[1] || null;
+}
+
+function rowIndexFromAsset(row) {
+	const raw =
+		row?.cmRowIndex ??
+		row?.rowData?.[AUTO_ROW_ID_COLUMN] ??
+		row?.primaryKey;
+	const index = Number(raw);
+	return Number.isFinite(index) && index > 0 ? index : null;
+}
+
+function mergeExistingAssetRow(
+	existingRow,
+	cmRowData,
+	cmColumns,
+	newColumns,
+	asOnlyColumns,
+	rowIndex
+) {
+	const merged = { ...(existingRow?.rowData || {}) };
+	const snapshot = existingRow?.cmSourceData || null;
+	let hasRowDataChange = false;
+
+	for (const column of cmColumns) {
+		const isNewColumn = newColumns.includes(column);
+		const cmChanged = copyMatrixCellChanged(snapshot, cmRowData, column);
+		if (!isNewColumn && !cmChanged) continue;
+		const nextValue = cmRowData?.[column] ?? "";
+		if (normalizeCellText(merged[column]) === normalizeCellText(nextValue)) {
+			if (isNewColumn && merged[column] == null) {
+				merged[column] = nextValue;
+				hasRowDataChange = true;
+			}
+			continue;
+		}
+		merged[column] = nextValue;
+		hasRowDataChange = true;
+	}
+
+	for (const column of asOnlyColumns) {
+		if (merged[column] == null) merged[column] = "";
+	}
+	if (!merged[AUTO_ROW_ID_COLUMN]) {
+		merged[AUTO_ROW_ID_COLUMN] = String(rowIndex);
+	}
+
+	return {
+		rowData: merged,
+		cmSourceData: snapshotCmSourceData(cmRowData, cmColumns),
+		hasRowDataChange,
+	};
+}
+
+function buildFreshAssetRow(cmRowData, asOnlyColumns, rowIndex) {
+	const rowData = { ...(cmRowData || {}) };
+	for (const column of asOnlyColumns) {
+		if (rowData[column] == null) rowData[column] = "";
+	}
+	rowData[AUTO_ROW_ID_COLUMN] = String(rowIndex);
+	return rowData;
+}
+
+async function mergeCopyMatrixIntoAssetUpload(fullUpload, matrix, userId = null) {
+	const { keyColumn, notice } = await resolveUniqueColumnWithFallback();
 	const importStatus = fullUpload.status === "draft" ? "DRAFT" : "ACTIVE";
+	const fileHash =
+		fullUpload.fileHash ||
+		matrix.fileHash ||
+		`cm_${matrix._id}_${Date.now()}`;
 
 	fullUpload.uniqueColumn = keyColumn;
 	matrix.uniqueColumn = keyColumn;
 	await matrix.save();
 
-	await AssetSource.deleteMany({ uploadId: fullUpload._id });
+	const cmRows = await CopyMatrixRow.find({ copyMatrixId: matrix._id })
+		.sort({ rowIndex: 1 })
+		.lean();
+	const existingRows = await AssetSource.find({
+		uploadId: fullUpload._id,
+	}).lean();
 
-	const inserted = await insertRowsFromCopyMatrix(
-		fullUpload,
-		matrix,
-		keyColumn,
-		importStatus
+	const cmColumns = omitRowIdColumn(matrix.columns || []);
+	const existingColumns = omitRowIdColumn(fullUpload.columns || []);
+	const asOnlyColumns = existingColumns.filter(
+		(column) => !cmColumns.includes(column)
 	);
+	const newColumns = cmColumns.filter(
+		(column) => !existingColumns.includes(column)
+	);
+	const nextColumns = ensureRowIdColumn([...existingColumns, ...newColumns]);
 
-	fullUpload.columns = ensureRowIdColumn(matrix.columns || []);
-	fullUpload.processedRows = inserted;
-	fullUpload.message = `Synced ${inserted} rows from copy matrix`;
+	const liveRows = existingRows.filter((row) => row.isDeleted !== true);
+	const existingByIndex = new Map();
+	for (const row of liveRows) {
+		const index = rowIndexFromAsset(row);
+		if (index != null && !existingByIndex.has(index)) {
+			existingByIndex.set(index, row);
+		}
+	}
+
+	const ops = [];
+	let inserted = 0;
+
+	for (const cmRow of cmRows) {
+		const rowIndex = cmRow.rowIndex || existingByIndex.size + inserted + 1;
+		const existing = existingByIndex.get(rowIndex);
+
+		if (existing) {
+			const merged = mergeExistingAssetRow(
+				existing,
+				cmRow.rowData,
+				cmColumns,
+				newColumns,
+				asOnlyColumns,
+				rowIndex
+			);
+			const snapshotUnchanged =
+				JSON.stringify(existing.cmSourceData || {}) ===
+				JSON.stringify(merged.cmSourceData || {});
+			if (
+				!merged.hasRowDataChange &&
+				existing.cmSourceData &&
+				snapshotUnchanged
+			) {
+				continue;
+			}
+			const primaryKey = buildPrimaryKey(
+				merged.rowData,
+				keyColumn,
+				rowIndex
+			);
+			ops.push({
+				updateOne: {
+					filter: { _id: existing._id },
+					update: {
+						$set: {
+							primaryKey,
+							rowData: merged.rowData,
+							fileHash,
+							isDeleted: false,
+							importStatus,
+							cmRowIndex: rowIndex,
+							cmSourceData: merged.cmSourceData,
+						},
+					},
+				},
+			});
+			continue;
+		}
+
+		const rowData = buildFreshAssetRow(
+			cmRow.rowData,
+			asOnlyColumns,
+			rowIndex
+		);
+		const primaryKey = buildPrimaryKey(rowData, keyColumn, rowIndex);
+		ops.push({
+			insertOne: {
+				document: {
+					uploadId: fullUpload._id,
+					primaryKey,
+					rowData,
+					fileHash,
+					isDeleted: false,
+					importStatus,
+					cmRowIndex: rowIndex,
+					cmSourceData: snapshotCmSourceData(cmRow.rowData, cmColumns),
+				},
+			},
+		});
+		inserted += 1;
+	}
+
+	if (ops.length > 0) {
+		await AssetSource.bulkWrite(ops, { ordered: true });
+	}
+
+	fullUpload.columns = nextColumns;
+	fullUpload.processedRows = liveRows.length + inserted;
+	fullUpload.message = `Updated existing asset source — kept existing rows and added ${inserted} new row${
+		inserted === 1 ? "" : "s"
+	} from copy matrix`;
 	if (userId) {
 		fullUpload.uploadedBy = userId;
 	}
@@ -391,14 +522,59 @@ async function syncAssetSourceFromCopyMatrix(
 	return { upload: fullUpload, uniqueColumnNotice: notice };
 }
 
+async function syncAssetSourceFromCopyMatrix(
+	matrixId,
+	userId = null,
+	uniqueColumn = null,
+	options = {}
+) {
+	const matrix = await CopyMatrix.findById(matrixId);
+	if (!matrix) return null;
+
+	let fullUpload = null;
+	if (options.uploadId) {
+		fullUpload = await AssetUpload.findById(options.uploadId);
+		if (!fullUpload) return null;
+		const linkedId = parseCopyMatrixIdFromUpload(fullUpload);
+		const reverseLinked =
+			String(matrix.assetUploadId || "") === String(fullUpload._id);
+		if (
+			String(linkedId || "") !== String(matrixId) &&
+			!reverseLinked
+		) {
+			const err = new Error(
+				"This asset source is not linked to that copy matrix"
+			);
+			err.statusCode = 400;
+			throw err;
+		}
+		if (!fullUpload.copyMatrixId) {
+			fullUpload.copyMatrixId = matrix._id;
+		}
+	} else {
+		const upload = await resolveLinkedAssetUpload(matrix);
+		if (!upload) return null;
+		fullUpload = await AssetUpload.findById(upload._id);
+	}
+
+	if (!fullUpload) return null;
+
+	return mergeCopyMatrixIntoAssetUpload(fullUpload, matrix, userId);
+}
+
 module.exports = {
 	createAssetSourceFromCopyMatrix,
 	syncAssetSourceFromCopyMatrix,
+	mergeCopyMatrixIntoAssetUpload,
 	resolveLinkedAssetUpload,
 	clearCopyMatrixAssetUploadLink,
 	resolveUniqueColumnWithFallback,
 	isColumnUnique,
 	analyzeColumnUniqueness,
+	parseCopyMatrixIdFromUpload,
+	rowIndexFromAsset,
+	snapshotCmSourceData,
+	copyMatrixCellChanged,
 	AUTO_ROW_ID_COLUMN,
 	resolveUniqueColumn,
 };

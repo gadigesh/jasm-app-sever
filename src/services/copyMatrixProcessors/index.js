@@ -10,6 +10,7 @@ const {
 	extractSheetId,
 	extractGid,
 	resolveSheetFromMeta,
+	fetchHiddenRowFlags,
 } = require("../../utils/gsheetHelpers");
 const {
 	AUTO_ROW_ID_COLUMN,
@@ -104,6 +105,7 @@ async function processXlsx(matrixDoc) {
 
 	for (let i = 2; i <= worksheet.rowCount; i++) {
 		const row = worksheet.getRow(i);
+		if (row.hidden) continue;
 		const rowArr = [];
 		for (let col = 1; col <= maxCol; col++) {
 			const value = getExcelCellValue(row.getCell(col).value);
@@ -160,7 +162,16 @@ async function processGsheet(matrixDoc) {
 		};
 	}
 
-	const { headers, rows } = resolveHeadersFromGrid(values);
+	const hiddenFlags = await fetchHiddenRowFlags(
+		sheets,
+		sheetId,
+		escapedTitle,
+		values.length
+	);
+	const visibleValues = values.filter(
+		(_row, idx) => idx === 0 || !hiddenFlags[idx]
+	);
+	const { headers, rows } = resolveHeadersFromGrid(visibleValues);
 
 	return {
 		rows,
@@ -168,6 +179,23 @@ async function processGsheet(matrixDoc) {
 		sheetTitle: title,
 		sheetGid: sheetInfo.properties.sheetId,
 	};
+}
+
+async function parseCopyMatrixSource(matrixDoc) {
+	if (!matrixDoc?.fileRef) {
+		throw new Error("This copy matrix has no source file or Google Sheet to refresh");
+	}
+
+	if (matrixDoc.inputType === "gsheet") {
+		return processGsheet(matrixDoc);
+	}
+	if (matrixDoc.fileType === "csv" || matrixDoc.fileType === "txt") {
+		return processCsv(matrixDoc);
+	}
+	if (matrixDoc.fileType === "xlsx" || matrixDoc.fileType === "xls") {
+		return processXlsx(matrixDoc);
+	}
+	throw new Error("Unsupported file type");
 }
 
 async function processCopyMatrix(matrixId, { draft = false } = {}) {
@@ -181,15 +209,7 @@ async function processCopyMatrix(matrixId, { draft = false } = {}) {
 	try {
 		let result = { rows: [], columns: [] };
 
-		if (matrixDoc.inputType === "gsheet") {
-			result = await processGsheet(matrixDoc);
-		} else if (matrixDoc.fileType === "csv" || matrixDoc.fileType === "txt") {
-			result = await processCsv(matrixDoc);
-		} else if (matrixDoc.fileType === "xlsx" || matrixDoc.fileType === "xls") {
-			result = await processXlsx(matrixDoc);
-		} else {
-			throw new Error("Unsupported file type");
-		}
+		result = await parseCopyMatrixSource(matrixDoc);
 
 		const inserted = await saveRows(matrixId, result.rows);
 
@@ -218,4 +238,4 @@ async function processCopyMatrix(matrixId, { draft = false } = {}) {
 	}
 }
 
-module.exports = { processCopyMatrix, saveRows };
+module.exports = { processCopyMatrix, parseCopyMatrixSource, saveRows };

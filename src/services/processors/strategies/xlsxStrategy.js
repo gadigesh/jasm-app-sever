@@ -1,7 +1,8 @@
 const ExcelJS = require("exceljs");
 const fs = require("fs");
 const { processBatch } = require("../batchLogic");
-const { getExcelCellValue } = require("../helper");
+const { assignRowKey, getExcelCellValue } = require("../helper");
+const { isAutoRowIdColumn } = require("../../../constants/copyMatrix");
 const {
 	buildHeadersFromHeaderRow,
 	rowDataFromArray,
@@ -47,7 +48,7 @@ async function processMemoryXLSX(uploadDoc, uniqueKey, seenKeys, fileHash, userI
 
 	const headers = buildHeadersFromHeaderRow(headerCells, maxCol);
 
-	if (!headers.includes(uniqueKey)) {
+	if (!isAutoRowIdColumn(uniqueKey) && !headers.includes(uniqueKey)) {
 		throw new Error(`Header "${uniqueKey}" not found in Excel.`);
 	}
 
@@ -67,10 +68,10 @@ async function processMemoryXLSX(uploadDoc, uniqueKey, seenKeys, fileHash, userI
 
 		if (!hasRealData) continue; // Skip truly empty rows
 
-		const keyVal = rowData[uniqueKey];
+		const keyVal = assignRowKey(rowData, uniqueKey, i - 1);
 
 		// Validation
-		if (!keyVal) {
+		if (!keyVal && !isAutoRowIdColumn(uniqueKey)) {
 			if (validationErrors.length < MAX_VALIDATION_ERRORS) {
 				validationErrors.push({
 					row: i,
@@ -81,7 +82,7 @@ async function processMemoryXLSX(uploadDoc, uniqueKey, seenKeys, fileHash, userI
 			continue;
 		}
 
-		if (seenKeys.has(keyVal)) {
+		if (!isAutoRowIdColumn(uniqueKey) && seenKeys.has(keyVal)) {
 			if (validationErrors.length < MAX_VALIDATION_ERRORS) {
 				validationErrors.push({
 					row: i,

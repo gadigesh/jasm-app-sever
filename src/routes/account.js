@@ -9,7 +9,7 @@ const {
 } = require("../services/mindshareAssetLibrary");
 const { formatApiError } = require("../utils/apiErrors");
 
-const normalize = (value) => value.trim().toLowerCase();
+const normalize = (value) => value.trim();
 const ACCOUNT_ASSET_CACHE_TTL_MS = 60 * 1000;
 const accountAssetCache = new Map();
 
@@ -74,7 +74,6 @@ accountRouter.post("/accounts/create", userAuth, async (req, res) => {
 		const normalAccountName = normalize(accountName);
 		const normalClientName = normalize(clientName);
 
-		// 🔍 Check existing account
 		const existingAccount = await Account.findOne({
 			accountName: normalAccountName,
 			clientName: normalClientName,
@@ -86,7 +85,6 @@ accountRouter.post("/accounts/create", userAuth, async (req, res) => {
 			});
 		}
 
-		// Create & save
 		const account = await Account.create({
 			accountName: normalAccountName,
 			clientName: normalClientName,
@@ -122,8 +120,16 @@ accountRouter.post("/accounts/create", userAuth, async (req, res) => {
 
 accountRouter.post("/switch-account", userAuth, async (req, res) => {
 	const { accountId } = req.body;
+	if (!accountId) {
+		return res.status(400).json({ message: "Account id is required" });
+	}
 
-	req.user.activeAccountId = accountId;
+	const account = await Account.findById(accountId);
+	if (!account) {
+		return res.status(404).json({ message: "Account not found" });
+	}
+
+	req.user.activeAccountId = account._id;
 	await req.user.save();
 
 	res.json({ message: "Active account updated" });

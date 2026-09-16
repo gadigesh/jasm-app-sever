@@ -1,5 +1,7 @@
 const { google } = require("googleapis");
 const { processBatch } = require("../batchLogic");
+const { assignRowKey } = require("../helper");
+const { isAutoRowIdColumn } = require("../../../constants/copyMatrix");
 const {
 	extractSheetId,
 	extractGid,
@@ -66,7 +68,7 @@ async function processGoogleSheet(uploadDoc, uniqueKey, seenKeys, fileHash, user
 
 	let headers = buildHeadersFromHeaderRow(headerRow, initialMaxCols);
 
-	if (!headers.includes(uniqueKey)) {
+	if (!isAutoRowIdColumn(uniqueKey) && !headers.includes(uniqueKey)) {
 		throw new Error(`Header "${uniqueKey}" not found in Google Sheet.`);
 	}
 
@@ -118,10 +120,10 @@ async function processGoogleSheet(uploadDoc, uniqueKey, seenKeys, fileHash, user
 				const realRowNumber = currentRow + idx;
 				const { rowData: obj } = rowDataFromArray(rowArr, headers);
 
-				const keyVal = obj[uniqueKey];
+				const keyVal = assignRowKey(obj, uniqueKey, realRowNumber - 1);
 
 				// Validation
-				if (!keyVal) {
+				if (!keyVal && !isAutoRowIdColumn(uniqueKey)) {
 					if (validationErrors.length < MAX_VALIDATION_ERRORS) {
 						validationErrors.push({
 							row: realRowNumber,
@@ -130,7 +132,7 @@ async function processGoogleSheet(uploadDoc, uniqueKey, seenKeys, fileHash, user
 					}
 					return;
 				}
-				if (seenKeys.has(keyVal)) {
+				if (!isAutoRowIdColumn(uniqueKey) && seenKeys.has(keyVal)) {
 					if (validationErrors.length < MAX_VALIDATION_ERRORS) {
 						validationErrors.push({
 							row: realRowNumber,

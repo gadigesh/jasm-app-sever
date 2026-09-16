@@ -519,9 +519,7 @@ async function renameAssetSourceColumn(upload, oldName, newName, userId) {
 	if (oldName === trimmed) return upload;
 
 	upload.columns = columns.map((col) => (col === oldName ? trimmed : col));
-	if (upload.uniqueColumn === oldName) {
-		upload.uniqueColumn = trimmed;
-	}
+	upload.uniqueColumn = AUTO_ROW_ID_COLUMN;
 
 	await AssetSource.updateMany(
 		{ uploadId: upload._id },
@@ -541,15 +539,8 @@ async function deleteAssetSourceColumn(upload, column, userId) {
 	assertColumnExists(upload, column);
 	assertEditableDataColumn(column);
 
-	if (upload.uniqueColumn === column) {
-		const err = new Error(
-			"Cannot delete the unique column. Change the unique column first."
-		);
-		err.statusCode = 400;
-		throw err;
-	}
-
 	upload.columns = (upload.columns || []).filter((col) => col !== column);
+	upload.uniqueColumn = AUTO_ROW_ID_COLUMN;
 
 	await AssetSource.updateMany(
 		{ uploadId: upload._id },

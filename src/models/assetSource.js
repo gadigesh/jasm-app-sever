@@ -38,6 +38,9 @@ const AssetSourceSchema = new mongoose.Schema(
 			type: Number,
 			index: true,
 		},
+		cmSourceData: {
+			type: mongoose.Schema.Types.Mixed,
+		},
 	},
 	{
 		timestamps: true, // gives createdAt & updatedAt

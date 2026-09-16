@@ -9,6 +9,10 @@ const AssetUpload = require("../models/assetUpload");
 const storageService = require("../services/storage");
 const { processCopyMatrix } = require("../services/copyMatrixProcessors");
 const {
+	previewCopyMatrixRefresh,
+	applyCopyMatrixRefresh,
+} = require("../services/copyMatrixRefresh");
+const {
 	createAssetSourceFromCopyMatrix,
 	syncAssetSourceFromCopyMatrix,
 	resolveLinkedAssetUpload,
@@ -40,6 +44,7 @@ const {
 const {
 	AUTO_ROW_ID_COLUMN,
 	ensureRowIdColumn,
+	omitRowIdColumn,
 	injectRowIdIntoRowData,
 	normalizeRowDataValues,
 	isAutoRowIdColumn,
@@ -160,6 +165,7 @@ async function applyCopyMatrixRowUpdates(matrix, rows, userId) {
 	matrix.updatedBy = userId;
 	await matrix.save();
 }
+
 
 async function refreshCopyMatrixRowCount(matrix) {
 	const count = await CopyMatrixRow.countDocuments({
@@ -742,6 +748,7 @@ copyMatrixRouter.get(
 					? matrix.updatedBy.firstName
 					: "Unknown",
 				updatedAt: matrix.updatedAt,
+				canRefresh: Boolean(matrix.fileRef),
 				assetUploadId: hasActiveLinkedUpload ? linkedId : null,
 				mappedAssetSource,
 				mappedAssetSources,
@@ -909,10 +916,8 @@ copyMatrixRouter.get(
 				.sort({ rowIndex: 1 })
 				.lean();
 
-			const columns = ensureRowIdColumn(matrix.columns || []);
-			const rows = cmRows.map((row) =>
-				injectRowIdIntoRowData(row.rowData || {}, row.rowIndex)
-			);
+			const columns = omitRowIdColumn(matrix.columns || []);
+			const rows = cmRows.map((row) => row.rowData || {});
 			const csv = buildCsv(columns, rows);
 			sendCsv(res, matrix.name || "copy-matrix", csv);
 		} catch (err) {
@@ -1000,6 +1005,8 @@ copyMatrixRouter.get("/copy-matrix/:id", userAuth, async (req, res) => {
 					? matrix.updatedBy.firstName
 					: "Unknown",
 				updatedAt: matrix.updatedAt,
+				canRefresh: Boolean(matrix.fileRef),
+				inputType: matrix.inputType,
 				assetUploadId: linkState.assetUploadId,
 				syncedColumns: linkState.upload
 					? ensureRowIdColumn(linkState.upload?.columns || [])
@@ -1017,6 +1024,89 @@ copyMatrixRouter.get("/copy-matrix/:id", userAuth, async (req, res) => {
 		res.status(500).json({ message: "Failed to fetch copy matrix" });
 	}
 });
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/refresh",
+	userAuth,
+	async (req, res) => {
+		try {
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res
+					.status(404)
+					.json({ message: "Copy matrix not found" });
+			}
+
+			const preview = await previewCopyMatrixRefresh(matrix);
+			res.status(200).json({
+				message: preview.hasChanges
+					? "Source updates are ready to review"
+					: "Copy matrix is already up to date",
+				data: preview,
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(
+					err,
+					"Failed to refresh copy matrix from source"
+				),
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/refresh/apply",
+	userAuth,
+	async (req, res) => {
+		try {
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				return res
+					.status(404)
+					.json({ message: "Copy matrix not found" });
+			}
+
+			const applied = await applyCopyMatrixRefresh(matrix);
+			matrix.updatedBy = req.user._id;
+			await matrix.save();
+
+			const linkedUpload = await resolveLinkedAssetUpload(matrix);
+			const assetUploadId = toIdString(linkedUpload?._id);
+
+			try {
+				await logCopyMatrixAction(matrix._id, req.user._id, "sync", [
+					{
+						field: "refreshedRows",
+						oldValue: null,
+						newValue: applied.processedRows,
+					},
+				]);
+			} catch (historyErr) {
+				console.error("Copy matrix refresh log failed:", historyErr);
+			}
+
+			res.status(200).json({
+				message: applied.hasChanges
+					? "Copy matrix updated from source"
+					: "Copy matrix is already up to date",
+				data: {
+					...applied,
+					assetUploadId,
+				},
+			});
+		} catch (err) {
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(
+					err,
+					"Failed to apply copy matrix refresh"
+				),
+			});
+		}
+	}
+);
 
 copyMatrixRouter.post(
 	"/copy-matrix/gsheet/sheets",
@@ -1121,40 +1211,10 @@ copyMatrixRouter.put("/copy-matrix/:id/rows", userAuth, async (req, res) => {
 			return res.status(404).json({ message: "Copy matrix not found" });
 		}
 
-		const uniqueColumn =
-			matrix.uniqueColumn || AUTO_ROW_ID_COLUMN;
-		const uniqueness = await analyzeColumnUniqueness(
-			matrix._id,
-			uniqueColumn,
-			rows
-		);
-		if (!uniqueness.unique) {
-			return res.status(409).json({
-				message: uniqueness.message,
-				code: "UNIQUE_COLUMN_DUPLICATES",
-				data: uniqueness,
-			});
-		}
-
 		await applyCopyMatrixRowUpdates(matrix, rows, req.user._id);
 
 		const linkedUpload = await resolveLinkedAssetUpload(matrix);
-		let assetUploadId = toIdString(linkedUpload?._id);
-		if (assetUploadId) {
-			const synced = await syncAssetSourceFromCopyMatrix(
-				matrix._id,
-				req.user._id
-			);
-			assetUploadId =
-				toIdString(synced?.upload?._id) || assetUploadId;
-			await logCopyMatrixAction(matrix._id, req.user._id, "sync", [
-				{
-					field: "syncedRows",
-					oldValue: null,
-					newValue: synced?.upload?.processedRows ?? 0,
-				},
-			]);
-		}
+		const assetUploadId = toIdString(linkedUpload?._id);
 
 		res.status(200).json({
 			message: "Rows updated successfully",
@@ -1704,6 +1764,8 @@ copyMatrixRouter.post(
 				folder,
 				{ dryRun, rowSnapshots, rowOverrides }
 			);
+			if (!result.dryRun) {
+			}
 
 			res.status(200).json({
 				message: result.dryRun
@@ -1906,20 +1968,6 @@ copyMatrixRouter.post(
 			}
 
 			if (Array.isArray(rows) && rows.length > 0) {
-				const uniqueColumn =
-					matrix.uniqueColumn || AUTO_ROW_ID_COLUMN;
-				const uniqueness = await analyzeColumnUniqueness(
-					matrix._id,
-					uniqueColumn,
-					rows
-				);
-				if (!uniqueness.unique) {
-					return res.status(409).json({
-						message: uniqueness.message,
-						code: "UNIQUE_COLUMN_DUPLICATES",
-						data: uniqueness,
-					});
-				}
 				await applyCopyMatrixRowUpdates(matrix, rows, req.user._id);
 			}
 
@@ -1980,7 +2028,6 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 	try {
 		const {
 			name,
-			uniqueColumn,
 			assetSourceName,
 			forceNewAssetSource,
 			finalizeOnly,
@@ -1992,22 +2039,6 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 		}
 
 		if (matrix.status === "draft" && finalizeOnly) {
-			const requestedUnique =
-				uniqueColumn?.trim() ||
-				matrix.uniqueColumn ||
-				AUTO_ROW_ID_COLUMN;
-			const uniqueness = await analyzeColumnUniqueness(
-				matrix._id,
-				requestedUnique
-			);
-			if (!uniqueness.unique) {
-				return res.status(409).json({
-					message: uniqueness.message,
-					code: "UNIQUE_COLUMN_DUPLICATES",
-					data: uniqueness,
-				});
-			}
-
 			if (name?.trim()) {
 				matrix.name = name.trim();
 			}
@@ -2018,9 +2049,7 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 				matrix._id
 			);
 
-			if (uniqueColumn?.trim()) {
-				matrix.uniqueColumn = uniqueColumn.trim();
-			}
+			matrix.uniqueColumn = AUTO_ROW_ID_COLUMN;
 
 			const prevStatus = matrix.status;
 			matrix.status = "completed";
@@ -2117,25 +2146,13 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 		const prevStatus = matrix.status;
 		let assetUpload = forceNewAssetSource ? null : linkedUpload;
 		let uniqueColumnNotice = null;
-
-		const fromBody =
-			typeof uniqueColumn === "string" ? uniqueColumn.trim() : "";
-		const fromMatrix =
-			typeof matrix.uniqueColumn === "string"
-				? matrix.uniqueColumn.trim()
-				: "";
-		// Body wins when provided; otherwise keep the CM selection.
-		const requestedUnique = fromBody || fromMatrix || null;
-
-		if (requestedUnique) {
-			matrix.uniqueColumn = requestedUnique;
-		}
+		matrix.uniqueColumn = AUTO_ROW_ID_COLUMN;
 
 		if (!assetUpload) {
 			const created = await createAssetSourceFromCopyMatrix(
 				matrix,
 				req.user._id,
-				requestedUnique || matrix.uniqueColumn,
+				AUTO_ROW_ID_COLUMN,
 				// New AS drafts start with the selected CM name. The user can
 				// still change it before Finish if that AS name already exists.
 				null
@@ -2149,7 +2166,7 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 			const synced = await syncAssetSourceFromCopyMatrix(
 				matrix._id,
 				req.user._id,
-				requestedUnique || matrix.uniqueColumn
+				AUTO_ROW_ID_COLUMN
 			);
 			assetUpload = synced.upload;
 			uniqueColumnNotice = synced.uniqueColumnNotice;
@@ -2160,7 +2177,7 @@ copyMatrixRouter.post("/copy-matrix/:id/finish", userAuth, async (req, res) => {
 			const synced = await syncAssetSourceFromCopyMatrix(
 				matrix._id,
 				req.user._id,
-				requestedUnique || matrix.uniqueColumn
+				AUTO_ROW_ID_COLUMN
 			);
 			assetUpload = synced.upload;
 			uniqueColumnNotice = synced.uniqueColumnNotice;
@@ -2336,7 +2353,7 @@ copyMatrixRouter.delete("/copy-matrix/:id", userAuth, async (req, res) => {
 
 copyMatrixRouter.put("/copy-matrix/:id", userAuth, async (req, res) => {
 	try {
-		const { status, name, uniqueColumn } = req.body;
+		const { status, name } = req.body;
 		const matrix = await CopyMatrix.findById(req.params.id);
 
 		if (!matrix) {
@@ -2368,27 +2385,7 @@ copyMatrixRouter.put("/copy-matrix/:id", userAuth, async (req, res) => {
 			}
 		}
 
-		if (typeof uniqueColumn === "string" && uniqueColumn.trim()) {
-			if (hasLinkedAssetSources) {
-				return res.status(400).json({
-					message:
-						"Cannot change unique column while synced with an asset source.",
-				});
-			}
-			const requestedUnique = uniqueColumn.trim();
-			const uniqueness = await analyzeColumnUniqueness(
-				matrix._id,
-				requestedUnique
-			);
-			if (!uniqueness.unique) {
-				return res.status(409).json({
-					message: uniqueness.message,
-					code: "UNIQUE_COLUMN_DUPLICATES",
-					data: uniqueness,
-				});
-			}
-			updates.uniqueColumn = requestedUnique;
-		}
+		updates.uniqueColumn = AUTO_ROW_ID_COLUMN;
 
 		if (status) {
 			updates.status = status;

@@ -3,6 +3,10 @@ const AssetSource = require("../../models/assetSource");
 const processStreamCSV = require("./strategies/csvStrategy");
 const processMemoryXLSX = require("./strategies/xlsxStrategy");
 const processGoogleSheet = require("./strategies/gsheetStrategy");
+const {
+	AUTO_ROW_ID_COLUMN,
+	ensureRowIdColumn,
+} = require("../../constants/copyMatrix");
 
 async function processUpload(uploadId) {
 	let uploadDoc = await AssetUpload.findById(uploadId).populate("uploadedBy");
@@ -15,7 +19,8 @@ async function processUpload(uploadId) {
 
 	console.log(`[Processor] Starting: ${uploadDoc.fileName}`);
 
-	const UNIQUE_KEY = uploadDoc.uniqueColumn;
+	uploadDoc.uniqueColumn = AUTO_ROW_ID_COLUMN;
+	const UNIQUE_KEY = AUTO_ROW_ID_COLUMN;
 	const CURRENT_HASH = uploadDoc.fileHash;
 	const USER_ID = uploadDoc.uploadedBy ? uploadDoc.uploadedBy._id : null; // 👈 Get User
 	
@@ -78,6 +83,22 @@ async function processUpload(uploadId) {
 		uploadDoc.processedRows =
 			(stats.created || 0) + (stats.updated || 0) + (stats.skipped || 0);
 		uploadDoc.validationErrors = validationErrors;
+		uploadDoc.uniqueColumn = AUTO_ROW_ID_COLUMN;
+		if (!uploadDoc.columns?.length) {
+			const sample = await AssetSource.findOne({
+				uploadId,
+				isDeleted: false,
+			})
+				.select("rowData")
+				.lean();
+			if (sample?.rowData) {
+				uploadDoc.columns = ensureRowIdColumn(
+					Object.keys(sample.rowData)
+				);
+			}
+		} else {
+			uploadDoc.columns = ensureRowIdColumn(uploadDoc.columns);
+		}
 
 		if (validationErrors && validationErrors.length > 0) {
 			uploadDoc.status = "partial_success";

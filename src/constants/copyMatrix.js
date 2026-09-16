@@ -5,6 +5,10 @@ function ensureRowIdColumn(columns = []) {
 	return [AUTO_ROW_ID_COLUMN, ...rest];
 }
 
+function omitRowIdColumn(columns = []) {
+	return columns.filter((col) => col !== AUTO_ROW_ID_COLUMN);
+}
+
 function injectRowIdIntoRowData(rowData, rowIndex) {
 	return {
 		...rowData,
@@ -35,10 +39,7 @@ function normalizeRowDataValues(rowData = {}) {
 	return next;
 }
 
-function resolveUniqueColumn(uniqueColumn, columns = []) {
-	const trimmed = uniqueColumn?.trim();
-	if (trimmed) return trimmed;
-	if (columns.includes(AUTO_ROW_ID_COLUMN)) return AUTO_ROW_ID_COLUMN;
+function resolveUniqueColumn() {
 	return AUTO_ROW_ID_COLUMN;
 }
 
@@ -49,6 +50,7 @@ function isAutoRowIdColumn(column) {
 module.exports = {
 	AUTO_ROW_ID_COLUMN,
 	ensureRowIdColumn,
+	omitRowIdColumn,
 	injectRowIdIntoRowData,
 	normalizeCellText,
 	normalizeRowDataValues,
