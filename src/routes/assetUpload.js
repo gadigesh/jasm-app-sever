@@ -68,6 +68,7 @@ const {
 	getAddedRowCountsByUpload,
 	previewAssetSourceRefresh,
 	applyAssetSourceRefresh,
+	decideAssetSourceRefresh,
 	resolveLinkedMatrixIdsByUpload,
 } = require("../services/assetSourceRefresh");
 
@@ -402,7 +403,7 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 				_id: { $in: objectIds },
 				accountId,
 			})
-				.select("_id name status")
+				.select("_id name status inputType fileRef")
 				.lean();
 
 			for (const matrix of byId) {
@@ -410,6 +411,10 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 					id: String(matrix._id),
 					name: matrix.name,
 					status: matrix.status,
+					fileRef:
+						matrix.inputType === "gsheet"
+							? matrix.fileRef || ""
+							: "",
 				});
 			}
 		}
@@ -419,7 +424,7 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 				assetUploadId: { $in: uploadIds },
 				accountId,
 			})
-				.select("_id name status assetUploadId")
+				.select("_id name status assetUploadId inputType fileRef")
 				.lean();
 
 			for (const matrix of byUpload) {
@@ -427,6 +432,10 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 					id: String(matrix._id),
 					name: matrix.name,
 					status: matrix.status,
+					fileRef:
+						matrix.inputType === "gsheet"
+							? matrix.fileRef || ""
+							: "",
 				});
 			}
 		}
@@ -463,6 +472,13 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 			addMatrix(matricesByUploadId.get(String(asset._id)));
 
 			const mappedCopyMatrix = mappedCopyMatrices[0] || null;
+			const sheetLink =
+				String(asset.generatedGoogleSheetUrl || "").trim() ||
+				(asset.inputType === "gsheet"
+					? String(asset.fileRef || "").trim()
+					: "") ||
+				mappedCopyMatrices.find((matrix) => matrix.fileRef)?.fileRef ||
+				"";
 			const linkedMatrixId =
 				linkedMatrixIds.get(String(asset._id)) ||
 				mappedCopyMatrix?.id ||
@@ -496,6 +512,8 @@ assetRouter.get("/list/:accountId", userAuth, async (req, res) => {
 				removedRowCount: changeCounts.removed,
 				newColumnCount: changeCounts.newColumns,
 				changedRowCount: changeCounts.total,
+				fileRef: sheetLink,
+				showCopyLink: true,
 			};
 		});
 
@@ -1403,7 +1421,16 @@ assetRouter.post("/source/:id/refresh/apply", userAuth, async (req, res) => {
 			return res.status(404).json({ message: "Asset source not found" });
 		}
 
-		const applied = await applyAssetSourceRefresh(upload, req.user._id);
+		const { action, rowIndexes, addedRowPatches } = req.body || {};
+		const applied =
+			action && Array.isArray(rowIndexes)
+				? await decideAssetSourceRefresh(upload, req.user._id, {
+						action,
+						rowIndexes,
+					})
+				: await applyAssetSourceRefresh(upload, req.user._id, {
+						addedRowPatches,
+					});
 		res.status(200).json({
 			message: applied.hasChanges
 				? "Asset source updated from copy matrix"
@@ -2118,6 +2145,7 @@ assetRouter.post(
 				dryRun,
 				rowSnapshots,
 				rowOverrides,
+				extraRows,
 			} = req.body;
 			const result = await updateColumnImages(
 				asset,
@@ -2127,7 +2155,7 @@ assetRouter.post(
 				req.user._id,
 				template,
 				folder,
-				{ dryRun, rowSnapshots, rowOverrides, targetColumns }
+				{ dryRun, rowSnapshots, rowOverrides, targetColumns, extraRows }
 			);
 			res.status(200).json({
 				message: result.dryRun

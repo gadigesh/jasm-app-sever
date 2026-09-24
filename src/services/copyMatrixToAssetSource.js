@@ -394,7 +394,40 @@ function buildFreshAssetRow(cmRowData, asOnlyColumns, rowIndex) {
 	return rowData;
 }
 
-async function mergeCopyMatrixIntoAssetUpload(fullUpload, matrix, userId = null) {
+function addedRowPatchMap(addedRowPatches) {
+	const patches = new Map();
+	for (const patch of addedRowPatches || []) {
+		const rowIndex = Number(patch?.rowIndex);
+		if (!Number.isFinite(rowIndex) || !patch?.rowData) continue;
+		patches.set(rowIndex, patch.rowData);
+	}
+	return patches;
+}
+
+function applyAddedRowPatch(rowData, patch) {
+	if (!patch || typeof patch !== "object") return rowData;
+	const next = { ...rowData };
+	for (const [key, value] of Object.entries(patch)) {
+		if (
+			!key ||
+			key === AUTO_ROW_ID_COLUMN ||
+			key === "_id" ||
+			key === "rowIndex" ||
+			key === "primaryKey"
+		) {
+			continue;
+		}
+		next[key] = value ?? "";
+	}
+	return next;
+}
+
+async function mergeCopyMatrixIntoAssetUpload(
+	fullUpload,
+	matrix,
+	userId = null,
+	options = {}
+) {
 	const { keyColumn, notice } = await resolveUniqueColumnWithFallback();
 	const importStatus = fullUpload.status === "draft" ? "DRAFT" : "ACTIVE";
 	const fileHash =
@@ -423,6 +456,7 @@ async function mergeCopyMatrixIntoAssetUpload(fullUpload, matrix, userId = null)
 	);
 	const nextColumns = ensureRowIdColumn([...existingColumns, ...newColumns]);
 
+	const addedPatches = addedRowPatchMap(options.addedRowPatches);
 	const liveRows = existingRows.filter((row) => row.isDeleted !== true);
 	const existingByIndex = new Map();
 	for (const row of liveRows) {
@@ -482,10 +516,9 @@ async function mergeCopyMatrixIntoAssetUpload(fullUpload, matrix, userId = null)
 			continue;
 		}
 
-		const rowData = buildFreshAssetRow(
-			cmRow.rowData,
-			asOnlyColumns,
-			rowIndex
+		const rowData = applyAddedRowPatch(
+			buildFreshAssetRow(cmRow.rowData, asOnlyColumns, rowIndex),
+			addedPatches.get(Number(rowIndex))
 		);
 		const primaryKey = buildPrimaryKey(rowData, keyColumn, rowIndex);
 		ops.push({
@@ -520,6 +553,190 @@ async function mergeCopyMatrixIntoAssetUpload(fullUpload, matrix, userId = null)
 	await fullUpload.save();
 
 	return { upload: fullUpload, uniqueColumnNotice: notice };
+}
+
+async function applyAssetSourceRefreshDecision(
+	fullUpload,
+	userId,
+	{ action, rowIndexes } = {}
+) {
+	const decision = action === "reject" ? "reject" : "approve";
+	const indexes = new Set(
+		(Array.isArray(rowIndexes) ? rowIndexes : [])
+			.map((value) => Number(value))
+			.filter((value) => Number.isFinite(value) && value > 0)
+	);
+	if (!indexes.size) {
+		const err = new Error("Select at least one row");
+		err.statusCode = 400;
+		throw err;
+	}
+
+	const matrix = await CopyMatrix.findById(fullUpload.copyMatrixId);
+	if (!matrix) {
+		const err = new Error("Linked copy matrix was not found");
+		err.statusCode = 404;
+		throw err;
+	}
+
+	const { keyColumn } = await resolveUniqueColumnWithFallback();
+	const cmRows = await CopyMatrixRow.find({ copyMatrixId: matrix._id })
+		.sort({ rowIndex: 1 })
+		.lean();
+	const existingRows = await AssetSource.find({
+		uploadId: fullUpload._id,
+		isDeleted: { $ne: true },
+	}).lean();
+	const cmColumns = omitRowIdColumn(matrix.columns || []);
+	const existingColumns = omitRowIdColumn(fullUpload.columns || []);
+	const asOnlyColumns = existingColumns.filter(
+		(column) => !cmColumns.includes(column)
+	);
+	const newColumns = cmColumns.filter(
+		(column) => !existingColumns.includes(column)
+	);
+	const existingByIndex = new Map();
+	for (const row of existingRows) {
+		const index = rowIndexFromAsset(row);
+		if (index != null && !existingByIndex.has(index)) {
+			existingByIndex.set(index, row);
+		}
+	}
+
+	const cmIndexSet = new Set(
+		cmRows
+			.map((row) => Number(row.rowIndex))
+			.filter((index) => Number.isFinite(index) && index > 0)
+	);
+	const fileHash =
+		fullUpload.fileHash || matrix.fileHash || `cm_${matrix._id}_${Date.now()}`;
+	const importStatus = fullUpload.status === "draft" ? "DRAFT" : "ACTIVE";
+	const ops = [];
+	let inserted = 0;
+	let removed = 0;
+	let approvedNewColumn = false;
+
+	for (const cmRow of cmRows) {
+		const rowIndex = Number(cmRow.rowIndex);
+		if (!indexes.has(rowIndex)) continue;
+		const existing = existingByIndex.get(rowIndex);
+
+		if (decision === "reject") {
+			if (!existing) continue;
+			ops.push({
+				updateOne: {
+					filter: { _id: existing._id },
+					update: {
+						$set: {
+							cmRowIndex: rowIndex,
+							cmSourceData: snapshotCmSourceData(
+								cmRow.rowData,
+								cmColumns
+							),
+						},
+					},
+				},
+			});
+			continue;
+		}
+
+		if (existing) {
+			const merged = mergeExistingAssetRow(
+				existing,
+				cmRow.rowData,
+				cmColumns,
+				newColumns,
+				asOnlyColumns,
+				rowIndex
+			);
+			if (newColumns.some((column) => column in (cmRow.rowData || {}))) {
+				approvedNewColumn = true;
+			}
+			ops.push({
+				updateOne: {
+					filter: { _id: existing._id },
+					update: {
+						$set: {
+							primaryKey: buildPrimaryKey(
+								merged.rowData,
+								keyColumn,
+								rowIndex
+							),
+							rowData: merged.rowData,
+							fileHash,
+							isDeleted: false,
+							importStatus,
+							cmRowIndex: rowIndex,
+							cmSourceData: merged.cmSourceData,
+						},
+					},
+				},
+			});
+			continue;
+		}
+
+		const rowData = buildFreshAssetRow(
+			cmRow.rowData,
+			asOnlyColumns,
+			rowIndex
+		);
+		approvedNewColumn = approvedNewColumn || newColumns.length > 0;
+		ops.push({
+			insertOne: {
+				document: {
+					uploadId: fullUpload._id,
+					primaryKey: buildPrimaryKey(rowData, keyColumn, rowIndex),
+					rowData,
+					fileHash,
+					isDeleted: false,
+					importStatus,
+					cmRowIndex: rowIndex,
+					cmSourceData: snapshotCmSourceData(cmRow.rowData, cmColumns),
+				},
+			},
+		});
+		inserted += 1;
+	}
+
+	for (const existing of existingRows) {
+		const rowIndex = rowIndexFromAsset(existing);
+		if (rowIndex == null || !indexes.has(rowIndex)) continue;
+		if (cmIndexSet.has(rowIndex) || !existing.cmSourceData) continue;
+		if (decision === "approve") {
+			ops.push({
+				updateOne: {
+					filter: { _id: existing._id },
+					update: { $set: { isDeleted: true } },
+				},
+			});
+			removed += 1;
+			continue;
+		}
+		ops.push({
+			updateOne: {
+				filter: { _id: existing._id },
+				update: { $unset: { cmSourceData: "" } },
+			},
+		});
+	}
+
+	if (ops.length > 0) {
+		await AssetSource.bulkWrite(ops, { ordered: true });
+	}
+
+	if (decision === "approve" && approvedNewColumn) {
+		fullUpload.columns = ensureRowIdColumn([
+			...existingColumns,
+			...newColumns,
+		]);
+	}
+	fullUpload.processedRows = Math.max(
+		0,
+		existingRows.length + inserted - removed
+	);
+	if (userId) fullUpload.uploadedBy = userId;
+	await fullUpload.save();
+	return fullUpload;
 }
 
 async function syncAssetSourceFromCopyMatrix(
@@ -559,12 +776,13 @@ async function syncAssetSourceFromCopyMatrix(
 
 	if (!fullUpload) return null;
 
-	return mergeCopyMatrixIntoAssetUpload(fullUpload, matrix, userId);
+	return mergeCopyMatrixIntoAssetUpload(fullUpload, matrix, userId, options);
 }
 
 module.exports = {
 	createAssetSourceFromCopyMatrix,
 	syncAssetSourceFromCopyMatrix,
+	applyAssetSourceRefreshDecision,
 	mergeCopyMatrixIntoAssetUpload,
 	resolveLinkedAssetUpload,
 	clearCopyMatrixAssetUploadLink,

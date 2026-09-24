@@ -12,6 +12,7 @@ const {
 	rowIndexFromAsset,
 	syncAssetSourceFromCopyMatrix,
 	copyMatrixCellChanged,
+	applyAssetSourceRefreshDecision,
 } = require("./copyMatrixToAssetSource");
 
 function cellText(rowData, column) {
@@ -420,6 +421,16 @@ async function previewAssetSourceRefresh(upload) {
 	}
 
 	const summary = summarizeChanges(changes);
+	const displayColumns = omitRowIdColumn([
+		...(upload.columns || []),
+		...newColumns,
+	]);
+	const unsyncedRows = buildUnsyncedRows({
+		changes,
+		asRows,
+		cmRows,
+		columns: displayColumns,
+	});
 
 	return {
 		hasChanges:
@@ -446,16 +457,89 @@ async function previewAssetSourceRefresh(upload) {
 		addedRows,
 		removedRows,
 		newColumns,
+		unsyncedRows,
+		columns: displayColumns,
 	};
 }
 
-async function applyAssetSourceRefresh(upload, userId) {
+function buildUnsyncedRows({ changes, asRows, cmRows, columns }) {
+	const grouped = new Map();
+	for (const change of changes || []) {
+		const rowIndex = Number(change.rowIndex);
+		if (!Number.isFinite(rowIndex)) continue;
+		if (!grouped.has(rowIndex)) {
+			grouped.set(rowIndex, {
+				rowIndex,
+				rowId: change.rowId || null,
+				statuses: new Set(),
+				changed: new Map(),
+			});
+		}
+		const entry = grouped.get(rowIndex);
+		if (change.rowId) entry.rowId = change.rowId;
+		if (change.status) entry.statuses.add(change.status);
+		if (change.column && change.column !== "Entire row") {
+			entry.changed.set(change.column, {
+				value: change.updatedValue ?? "",
+				previousValue: change.previousValue ?? "",
+				status: change.status,
+			});
+		}
+	}
+
+	const asByIndex = new Map();
+	for (const row of asRows || []) {
+		const index = rowIndexFromAsset(row);
+		if (index != null && !asByIndex.has(index)) asByIndex.set(index, row);
+	}
+	const cmByIndex = new Map(
+		(cmRows || []).map((row) => [Number(row.rowIndex), row])
+	);
+
+	return [...grouped.values()]
+		.map((entry) => {
+			const removed = entry.statuses.has("Removed");
+			const added =
+				entry.statuses.has("Added") && !asByIndex.has(entry.rowIndex);
+			const status = removed ? "Removed" : added ? "Added" : "Modified";
+			const sourceData = removed
+				? asByIndex.get(entry.rowIndex)?.rowData || {}
+				: added
+					? cmByIndex.get(entry.rowIndex)?.rowData || {}
+					: asByIndex.get(entry.rowIndex)?.rowData || {};
+			const fields = (columns || []).map((column) => {
+				const change = entry.changed.get(column);
+				const value = change
+					? change.value
+					: sourceData?.[column] ?? "";
+				return {
+					column,
+					value,
+					previousValue: change?.previousValue ?? "",
+					changed: Boolean(change),
+					status: change?.status || "",
+				};
+			});
+			return {
+				rowIndex: entry.rowIndex,
+				rowId: entry.rowId,
+				status,
+				fields,
+			};
+		})
+		.sort((left, right) => left.rowIndex - right.rowIndex);
+}
+
+async function applyAssetSourceRefresh(upload, userId, options = {}) {
 	const preview = await previewAssetSourceRefresh(upload);
 	const synced = await syncAssetSourceFromCopyMatrix(
 		preview.copyMatrixId,
 		userId,
 		null,
-		{ uploadId: upload._id }
+		{
+			uploadId: upload._id,
+			addedRowPatches: options.addedRowPatches,
+		}
 	);
 
 	return {
@@ -464,10 +548,16 @@ async function applyAssetSourceRefresh(upload, userId) {
 	};
 }
 
+async function decideAssetSourceRefresh(upload, userId, decision) {
+	await applyAssetSourceRefreshDecision(upload, userId, decision);
+	return previewAssetSourceRefresh(upload);
+}
+
 module.exports = {
 	getAddedRowCountsByUpload,
 	previewAssetSourceRefresh,
 	applyAssetSourceRefresh,
+	decideAssetSourceRefresh,
 	linkedCopyMatrixId,
 	resolveLinkedMatrixIdsByUpload,
 };

@@ -7,10 +7,15 @@ const CopyMatrix = require("../models/copyMatrix");
 const CopyMatrixRow = require("../models/copyMatrixRow");
 const AssetUpload = require("../models/assetUpload");
 const storageService = require("../services/storage");
-const { processCopyMatrix } = require("../services/copyMatrixProcessors");
+const {
+	processCopyMatrix,
+	parseCopyMatrixSource,
+} = require("../services/copyMatrixProcessors");
 const {
 	previewCopyMatrixRefresh,
 	applyCopyMatrixRefresh,
+	decideCopyMatrixRefresh,
+	assertSourceColumnsAllowed,
 } = require("../services/copyMatrixRefresh");
 const {
 	createAssetSourceFromCopyMatrix,
@@ -749,6 +754,10 @@ copyMatrixRouter.get(
 					: "Unknown",
 				updatedAt: matrix.updatedAt,
 				canRefresh: Boolean(matrix.fileRef),
+				inputType: matrix.inputType || "file",
+				fileType: matrix.fileType || "",
+				fileRef:
+					matrix.inputType === "gsheet" ? matrix.fileRef || "" : "",
 				assetUploadId: hasActiveLinkedUpload ? linkedId : null,
 				mappedAssetSource,
 				mappedAssetSources,
@@ -1007,6 +1016,9 @@ copyMatrixRouter.get("/copy-matrix/:id", userAuth, async (req, res) => {
 				updatedAt: matrix.updatedAt,
 				canRefresh: Boolean(matrix.fileRef),
 				inputType: matrix.inputType,
+				fileType: matrix.fileType || "",
+				fileRef:
+					matrix.inputType === "gsheet" ? matrix.fileRef || "" : "",
 				assetUploadId: linkState.assetUploadId,
 				syncedColumns: linkState.upload
 					? ensureRowIdColumn(linkState.upload?.columns || [])
@@ -1051,6 +1063,8 @@ copyMatrixRouter.post(
 					err,
 					"Failed to refresh copy matrix from source"
 				),
+				deletedColumns: err.deletedColumns || [],
+				editedColumns: err.editedColumns || [],
 			});
 		}
 	}
@@ -1068,7 +1082,21 @@ copyMatrixRouter.post(
 					.json({ message: "Copy matrix not found" });
 			}
 
-			const applied = await applyCopyMatrixRefresh(matrix);
+			const { action, rowIndexes } = req.body || {};
+			const applied =
+				action && Array.isArray(rowIndexes)
+					? await decideCopyMatrixRefresh(matrix, {
+							action,
+							rowIndexes,
+						})
+					: await applyCopyMatrixRefresh(matrix);
+			if (applied.staged) {
+				return res.status(200).json({
+					message:
+						"Save the copy matrix to approve these changes",
+					data: applied,
+				});
+			}
 			matrix.updatedBy = req.user._id;
 			await matrix.save();
 
@@ -1103,6 +1131,122 @@ copyMatrixRouter.post(
 					err,
 					"Failed to apply copy matrix refresh"
 				),
+				deletedColumns: err.deletedColumns || [],
+				editedColumns: err.editedColumns || [],
+			});
+		}
+	}
+);
+
+copyMatrixRouter.post(
+	"/copy-matrix/:id/source",
+	userAuth,
+	upload.single("file"),
+	async (req, res) => {
+		const cleanup = () => {
+			try {
+				if (req.file && fs.existsSync(req.file.path)) {
+					fs.unlinkSync(req.file.path);
+				}
+			} catch (err) {
+				console.error("Cleanup error:", err);
+			}
+		};
+		let storedFileRef = "";
+		let committed = false;
+
+		try {
+			const matrix = await CopyMatrix.findById(req.params.id);
+			if (!matrix) {
+				cleanup();
+				return res
+					.status(404)
+					.json({ message: "Copy matrix not found" });
+			}
+
+			const { inputType, fileRef, sheetGid } = req.body;
+			const isGSheet = inputType === "gsheet";
+			if (!isGSheet && !req.file) {
+				return res.status(400).json({ message: "No file uploaded" });
+			}
+			if (isGSheet && !fileRef?.trim()) {
+				return res
+					.status(400)
+					.json({ message: "Google Sheet URL or ID is required" });
+			}
+
+			let finalFileRef = isGSheet ? fileRef.trim() : "";
+			let resolvedSheetGid = null;
+			let fileName = "";
+			let fileType = "";
+
+			if (!isGSheet) {
+				finalFileRef = await storageService.saveFile(req.file);
+				storedFileRef = finalFileRef;
+				fileName = req.file.originalname;
+				fileType = path
+					.extname(req.file.originalname)
+					.replace(".", "")
+					.toLowerCase();
+			} else {
+				const gidFromBody =
+					sheetGid != null && sheetGid !== ""
+						? Number(sheetGid)
+						: null;
+				const gidFromUrl = extractGid(fileRef);
+				resolvedSheetGid =
+					gidFromBody != null && !Number.isNaN(gidFromBody)
+						? gidFromBody
+						: gidFromUrl;
+				fileName = "Google Sheet";
+				fileType = "GSheet";
+			}
+
+			const source = await parseCopyMatrixSource({
+				fileRef: finalFileRef,
+				inputType: isGSheet ? "gsheet" : "file",
+				fileType,
+				sheetGid: resolvedSheetGid,
+			});
+			assertSourceColumnsAllowed(matrix.columns, source.columns);
+
+			matrix.inputType = isGSheet ? "gsheet" : "file";
+			matrix.fileType = fileType;
+			matrix.fileRef = finalFileRef;
+			matrix.fileName = source.sheetTitle || fileName || matrix.fileName;
+			if (source.sheetGid != null) {
+				matrix.sheetGid = source.sheetGid;
+			} else if (resolvedSheetGid != null) {
+				matrix.sheetGid = resolvedSheetGid;
+			}
+			matrix.updatedBy = req.user._id;
+			await matrix.save();
+			committed = true;
+
+			const preview = await previewCopyMatrixRefresh(matrix);
+			res.status(200).json({
+				message: preview.hasChanges
+					? "Source updates are ready to review"
+					: "Copy matrix is already up to date",
+				data: preview,
+			});
+		} catch (err) {
+			if (!committed && storedFileRef) {
+				try {
+					await storageService.deleteFile(storedFileRef);
+				} catch (deleteErr) {
+					console.error("Stored file cleanup error:", deleteErr);
+				}
+			}
+			cleanup();
+			console.error(err);
+			res.status(err.statusCode || 500).json({
+				message: formatApiError(
+					err,
+					"Failed to upload copy matrix source"
+				),
+				deletedColumns: err.deletedColumns || [],
+				editedColumns: err.editedColumns || [],
 			});
 		}
 	}

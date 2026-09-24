@@ -913,8 +913,33 @@ async function updateColumnImages(
 			rowData:
 				r.rowData && typeof r.rowData === "object" ? r.rowData : {},
 		}));
+	} else if (Array.isArray(rowIds)) {
+		const savedIds = rowIds
+			.map((value) => String(value || "").trim())
+			.filter((value) => mongoose.Types.ObjectId.isValid(value));
+		rows = savedIds.length
+			? await loadTargetRows(upload._id, savedIds)
+			: [];
 	} else {
 		rows = await loadTargetRows(upload._id, rowIds);
+	}
+
+	const extraRows = Array.isArray(options.extraRows) ? options.extraRows : [];
+	if (extraRows.length) {
+		const seen = new Set(rows.map((row) => String(row._id)));
+		for (const extra of extraRows) {
+			const rowId = String(extra?._id || extra?.rowId || "");
+			if (!rowId || seen.has(rowId)) continue;
+			seen.add(rowId);
+			rows.push({
+				_id: rowId,
+				rowIndex: extra.rowIndex,
+				rowData:
+					extra.rowData && typeof extra.rowData === "object"
+						? extra.rowData
+						: {},
+			});
+		}
 	}
 
 	if (rowOverrides?.length) {
@@ -1197,7 +1222,7 @@ async function updateColumnImages(
 				column,
 				url,
 			});
-			if (!dryRun) {
+			if (!dryRun && mongoose.Types.ObjectId.isValid(String(row._id))) {
 				ops.push({
 					updateOne: {
 						filter: { _id: row._id },

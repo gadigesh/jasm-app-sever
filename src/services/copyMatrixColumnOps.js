@@ -207,6 +207,9 @@ async function deleteCopyMatrixRow(matrix, rowId, userId) {
 		throw err;
 	}
 	matrix.updatedBy = userId;
+	matrix.processedRows = await CopyMatrixRow.countDocuments({
+		copyMatrixId: matrix._id,
+	});
 	await matrix.save();
 	return { deleted: 1 };
 }
