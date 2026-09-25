@@ -467,7 +467,18 @@ async function mergeCopyMatrixIntoAssetUpload(
 	}
 
 	const ops = [];
+	const keyOwners = new Map();
 	let inserted = 0;
+	let removed = 0;
+	const cmIndexSet = new Set(
+		cmRows
+			.map((row) => Number(row.rowIndex))
+			.filter((index) => Number.isFinite(index) && index > 0)
+	);
+
+	const claimPrimaryKey = (primaryKey, ownerId) => {
+		keyOwners.set(String(primaryKey), ownerId ? String(ownerId) : "");
+	};
 
 	for (const cmRow of cmRows) {
 		const rowIndex = cmRow.rowIndex || existingByIndex.size + inserted + 1;
@@ -497,6 +508,7 @@ async function mergeCopyMatrixIntoAssetUpload(
 				keyColumn,
 				rowIndex
 			);
+			claimPrimaryKey(primaryKey, existing._id);
 			ops.push({
 				updateOne: {
 					filter: { _id: existing._id },
@@ -521,6 +533,42 @@ async function mergeCopyMatrixIntoAssetUpload(
 			addedPatches.get(Number(rowIndex))
 		);
 		const primaryKey = buildPrimaryKey(rowData, keyColumn, rowIndex);
+		const reusableRow = existingRows.find((row) => {
+			if (String(row.primaryKey ?? "") === String(primaryKey)) return true;
+			return (
+				row.isDeleted === true &&
+				rowIndexFromAsset(row) === Number(rowIndex)
+			);
+		});
+
+		if (reusableRow) {
+			claimPrimaryKey(primaryKey, reusableRow._id);
+			ops.push({
+				updateOne: {
+					filter: { _id: reusableRow._id },
+					update: {
+						$set: {
+							primaryKey,
+							rowData,
+							fileHash,
+							isDeleted: false,
+							importStatus,
+							cmRowIndex: rowIndex,
+							cmSourceData: snapshotCmSourceData(
+								cmRow.rowData,
+								cmColumns
+							),
+						},
+					},
+				},
+			});
+			if (reusableRow.isDeleted === true) {
+				inserted += 1;
+			}
+			continue;
+		}
+
+		claimPrimaryKey(primaryKey, "");
 		ops.push({
 			insertOne: {
 				document: {
@@ -538,15 +586,48 @@ async function mergeCopyMatrixIntoAssetUpload(
 		inserted += 1;
 	}
 
-	if (ops.length > 0) {
-		await AssetSource.bulkWrite(ops, { ordered: true });
+	for (const existing of liveRows) {
+		const rowIndex = rowIndexFromAsset(existing);
+		if (rowIndex == null || cmIndexSet.has(rowIndex) || !existing.cmSourceData) {
+			continue;
+		}
+		ops.push({
+			updateOne: {
+				filter: { _id: existing._id },
+				update: { $set: { isDeleted: true } },
+			},
+		});
+		removed += 1;
+	}
+
+	const releaseOps = [];
+	for (const row of existingRows) {
+		const ownerId = keyOwners.get(String(row.primaryKey ?? ""));
+		if (ownerId === undefined) continue;
+		if (String(row._id) === String(ownerId)) continue;
+		releaseOps.push({
+			updateOne: {
+				filter: { _id: row._id },
+				update: {
+					$set: {
+						primaryKey: `${row.primaryKey}__removed__${row._id}`,
+						isDeleted: true,
+					},
+				},
+			},
+		});
+	}
+
+	const writes = [...releaseOps, ...ops];
+	if (writes.length > 0) {
+		await AssetSource.bulkWrite(writes, { ordered: true });
 	}
 
 	fullUpload.columns = nextColumns;
-	fullUpload.processedRows = liveRows.length + inserted;
-	fullUpload.message = `Updated existing asset source — kept existing rows and added ${inserted} new row${
+	fullUpload.processedRows = Math.max(0, liveRows.length + inserted - removed);
+	fullUpload.message = `Updated existing asset source — kept existing rows, added ${inserted} new row${
 		inserted === 1 ? "" : "s"
-	} from copy matrix`;
+	}, and removed ${removed} row${removed === 1 ? "" : "s"} from copy matrix`;
 	if (userId) {
 		fullUpload.uploadedBy = userId;
 	}

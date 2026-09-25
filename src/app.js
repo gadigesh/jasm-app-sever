@@ -52,12 +52,14 @@ const accountRouter = require("./routes/account");
 const assetRouter = require("./routes/assetTemplate");
 const assetUploadRouter = require("./routes/assetUpload");
 const copyMatrixRouter = require("./routes/copyMatrix");
+const reviewImageRouter = require("./routes/reviewImage");
 
 app.use("/", authRouter);
 app.use("/", accountRouter);
 app.use("/", assetRouter);
 app.use("/", assetUploadRouter);
 app.use("/", copyMatrixRouter);
+app.use("/", reviewImageRouter);
 
 connectDB()
 	.then(() => {
