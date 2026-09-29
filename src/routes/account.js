@@ -6,7 +6,7 @@ const {
 	listAccountAssets,
 	pickAssetName,
 	pickAssetUrl,
-} = require("../services/mindshareAssetLibrary");
+} = require("../services/assetLibrary");
 const { formatApiError } = require("../utils/apiErrors");
 
 const normalize = (value) => value.trim();
@@ -170,9 +170,9 @@ accountRouter.get("/accounts", userAuth, async (req, res) => {
 	}
 });
 
-// Mindshare folders are account-scoped (same list for all CM/AS under an account).
+// Asset library folders are account-scoped (same list for all CM/AS under an account).
 accountRouter.get(
-	"/accounts/:accountId/mindshare/folders",
+	"/accounts/:accountId/asset-library/folders",
 	userAuth,
 	async (req, res) => {
 		try {
@@ -183,7 +183,7 @@ accountRouter.get(
 				return res.status(404).json({ message: "Account not found" });
 			}
 			// Share the same cached recursive library walk used by file preview.
-			// This avoids loading every Mindshare folder twice.
+			// This avoids loading every asset library folder twice.
 			// Uploads can create a new folder. Bypass the short-lived account
 			// cache so the folder dropdown reflects it immediately.
 			const result = await getAccountAssets(account._id, "", {
@@ -206,7 +206,7 @@ accountRouter.get(
 );
 
 accountRouter.get(
-	"/accounts/:accountId/mindshare/assets",
+	"/accounts/:accountId/asset-library/assets",
 	userAuth,
 	async (req, res) => {
 		try {

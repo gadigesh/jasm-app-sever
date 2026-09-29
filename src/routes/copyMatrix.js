@@ -40,7 +40,7 @@ const {
 	uploadAssetsToAccount,
 	listAccountFolders,
 	resolveUploadedCdnUrl,
-} = require("../services/mindshareAssetLibrary");
+} = require("../services/assetLibrary");
 const {
 	extractSheetId,
 	extractGid,
@@ -373,6 +373,8 @@ const handlePreviewUpload = async (req, res) => {
 		}
 	};
 
+	let createdMatrixId = null;
+
 	try {
 		const { accountId, name, inputType, fileRef, sheetGid } = req.body;
 		const isGSheet = inputType === "gsheet";
@@ -460,6 +462,7 @@ const handlePreviewUpload = async (req, res) => {
 			status: "pending",
 			updatedBy: req.user._id,
 		});
+		createdMatrixId = matrix._id;
 
 		await processCopyMatrix(matrix._id, { draft: true });
 		const finalMatrix = await CopyMatrix.findById(matrix._id);
@@ -467,6 +470,7 @@ const handlePreviewUpload = async (req, res) => {
 		if (!finalMatrix || finalMatrix.status === "failed") {
 			await CopyMatrix.findByIdAndDelete(matrix._id);
 			await CopyMatrixRow.deleteMany({ copyMatrixId: matrix._id });
+			createdMatrixId = null;
 			return res.status(500).json({
 				message:
 					finalMatrix?.message ||
@@ -489,11 +493,22 @@ const handlePreviewUpload = async (req, res) => {
 		});
 	} catch (err) {
 		cleanup();
+		if (createdMatrixId) {
+			try {
+				await CopyMatrix.findByIdAndDelete(createdMatrixId);
+				await CopyMatrixRow.deleteMany({
+					copyMatrixId: createdMatrixId,
+				});
+			} catch (deleteErr) {
+				console.error("Copy matrix preview cleanup error:", deleteErr);
+			}
+		}
 		console.error("Copy matrix preview error:", err);
-		res.status(500).json({
+		res.status(err.statusCode || 500).json({
 			message:
 				err.message ||
 				"Could not preview the copy matrix. Please check your file and try again.",
+			cellViolations: err.cellViolations || [],
 		});
 	}
 };
@@ -1065,6 +1080,7 @@ copyMatrixRouter.post(
 				),
 				deletedColumns: err.deletedColumns || [],
 				editedColumns: err.editedColumns || [],
+				cellViolations: err.cellViolations || [],
 			});
 		}
 	}
@@ -1247,6 +1263,7 @@ copyMatrixRouter.post(
 				),
 				deletedColumns: err.deletedColumns || [],
 				editedColumns: err.editedColumns || [],
+				cellViolations: err.cellViolations || [],
 			});
 		}
 	}

@@ -11,7 +11,7 @@ const {
 	buildUpdateImagesAssetIndex,
 	resolveAssetUrlByName,
 	resolveAssetUrlWithFallback,
-} = require("./mindshareAssetLibrary");
+} = require("./assetLibrary");
 
 function normalizeSearchQuery(value) {
 	if (value == null) return "";

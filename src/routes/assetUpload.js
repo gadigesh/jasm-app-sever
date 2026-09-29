@@ -56,7 +56,7 @@ const {
 	uploadAssetsToAccount,
 	listAccountFolders,
 	resolveUploadedCdnUrl,
-} = require("../services/mindshareAssetLibrary");
+} = require("../services/assetLibrary");
 const {
 	buildRowFilter,
 	buildRowSort,

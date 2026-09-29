@@ -4,8 +4,9 @@ const path = require("path");
 const { pipeline } = require("stream/promises");
 const { Transform } = require("stream");
 const unzipper = require("unzipper");
+const Account = require("../models/account");
 
-const DEFAULT_BASE_URL = process.env.MINDSHARE_API_BASE_URL;
+const DEFAULT_BASE_URL = process.env.ASSET_LIBRARY_API_BASE_URL;
 const MAX_UPLOAD_BATCH_BYTES = 9 * 1024 * 1024;
 const MAX_EXTRACTED_ZIP_BYTES = 500 * 1024 * 1024;
 const MAX_ZIP_ENTRIES = 500;
@@ -26,21 +27,87 @@ const MIME_TYPES_BY_EXTENSION = {
 	tiff: "image/tiff",
 };
 
-function getBaseUrl() {
-	return String(process.env.MINDSHARE_API_BASE_URL || DEFAULT_BASE_URL)
+const ACCOUNT_ENV_KEY_CACHE_TTL_MS = 60 * 1000;
+const accountEnvKeyCache = new Map();
+
+function toAccountEnvKey(accountName) {
+	return String(accountName || "")
 		.trim()
-		.replace(/\/+$/, "");
+		.toUpperCase()
+		.replace(/[^A-Z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
 }
 
-function buildAuthHeaders() {
-	const headers = {};
-	const apiKey = String(
-		process.env.MINDSHARE_API_KEY || process.env.MINDSHARE_API_TOKEN || ""
-	).trim();
-	const cookie = String(process.env.MINDSHARE_API_COOKIE || "").trim();
-	const authHeader = String(process.env.MINDSHARE_AUTH_HEADER || "").trim();
+async function resolveAccountEnvKey(accountId) {
+	const id = String(accountId || "").trim();
+	if (!id) return "";
+	const cached = accountEnvKeyCache.get(id);
+	if (cached && cached.expiresAt > Date.now()) return cached.key;
 
-	// Mindshare asset-library expects x-api-key (cookie/Bearer alone return 401).
+	let key = "";
+	try {
+		const account = await Account.findById(id).select("accountName").lean();
+		key = toAccountEnvKey(account?.accountName);
+	} catch {
+		key = "";
+	}
+	accountEnvKeyCache.set(id, {
+		key,
+		expiresAt: Date.now() + ACCOUNT_ENV_KEY_CACHE_TTL_MS,
+	});
+	return key;
+}
+
+function readAccountEnv(accountKey, suffix) {
+	if (!accountKey) return "";
+	return String(
+		process.env[`ASSET_LIBRARY_${accountKey}_${suffix}`] || ""
+	).trim();
+}
+
+async function getAssetLibraryConfig(accountId) {
+	const accountKey = await resolveAccountEnvKey(accountId);
+	return buildAssetLibraryConfig(accountKey);
+}
+
+function buildAssetLibraryConfig(accountKey) {
+	return {
+		baseUrl: (
+			readAccountEnv(accountKey, "BASE_URL") ||
+			String(process.env.ASSET_LIBRARY_API_BASE_URL || DEFAULT_BASE_URL || "")
+		)
+			.trim()
+			.replace(/\/+$/, ""),
+		apiKey:
+			readAccountEnv(accountKey, "API_KEY") ||
+			String(
+				process.env.ASSET_LIBRARY_API_KEY ||
+					process.env.ASSET_LIBRARY_API_TOKEN ||
+					""
+			).trim(),
+		advId:
+			readAccountEnv(accountKey, "ACC_ID") ||
+			String(process.env.ASSET_LIBRARY_ACCOUNT_ID || "").trim(),
+		cookie:
+			readAccountEnv(accountKey, "API_COOKIE") ||
+			String(process.env.ASSET_LIBRARY_API_COOKIE || "").trim(),
+		authHeader:
+			readAccountEnv(accountKey, "AUTH_HEADER") ||
+			String(process.env.ASSET_LIBRARY_AUTH_HEADER || "").trim(),
+	};
+}
+
+async function getBaseUrl(accountId) {
+	return (await getAssetLibraryConfig(accountId)).baseUrl;
+}
+
+async function buildAuthHeaders(accountId) {
+	const headers = {};
+	const { apiKey, cookie, authHeader } = await getAssetLibraryConfig(
+		accountId
+	);
+
+	// Asset library expects x-api-key (cookie/Bearer alone return 401).
 	if (apiKey) {
 		headers["x-api-key"] = apiKey.replace(/^session=/i, "");
 	} else if (cookie) {
@@ -61,11 +128,12 @@ function buildAuthHeaders() {
 	return headers;
 }
 
-async function resolveAccountAdvId(_accountId) {
-	// Temporary hardcode while Mindshare account mapping is finalized.
-	const advId = String(process.env.MINDSHARE_ACCOUNT_ID || "29509").trim();
+async function resolveAccountAdvId(accountId) {
+	const { advId } = await getAssetLibraryConfig(accountId);
 	if (!advId) {
-		const err = new Error("MINDSHARE_ACCOUNT_ID is not configured");
+		const err = new Error(
+			`Asset library account ID is not configured for account ${accountId}`
+		);
 		err.statusCode = 500;
 		throw err;
 	}
@@ -130,7 +198,7 @@ function pickAssetName(asset) {
 function normalizeAssetList(payload) {
 	if (!payload) return [];
 	if (Array.isArray(payload)) return payload;
-	// Mindshare asset-library returns { files, folders }
+	// Asset library returns { files, folders }
 	if (Array.isArray(payload.files)) return payload.files;
 	if (Array.isArray(payload.data)) return payload.data;
 	if (Array.isArray(payload.assets)) return payload.assets;
@@ -421,14 +489,14 @@ function splitUploadBatches(files) {
 			err.statusCode = 413;
 			throw err;
 		}
-		// Mindshare accepts the multipart request but processes only the first
+		// The asset library accepts the multipart request but processes only the first
 		// `files` part. Keep one extracted image per request so ZIP uploads do
 		// not silently lose every image after the first one.
 		return [file];
 	});
 }
 
-async function uploadFileBatch(advId, files, folderPath) {
+async function uploadFileBatch(accountId, advId, files, folderPath) {
 	const form = new FormData();
 	if (folderPath) {
 		// Support both folder naming conventions used by the asset-library API.
@@ -442,7 +510,7 @@ async function uploadFileBatch(advId, files, folderPath) {
 			type: file.mimetype || "application/octet-stream",
 		});
 		// Send each upload once. Adding both `file` and `files` duplicated the
-		// payload and could push a valid request over Mindshare's 10 MB limit.
+		// payload and could push a valid request over the asset library's 10 MB limit.
 		form.append("files", blob, file.originalname || path.basename(file.path));
 	}
 
@@ -452,10 +520,10 @@ async function uploadFileBatch(advId, files, folderPath) {
 		  )}`
 		: "";
 	const response = await fetch(
-		`${getBaseUrl()}/v2/accounts/${advId}/asset-library${query}`,
+		`${await getBaseUrl(accountId)}/v2/accounts/${advId}/asset-library${query}`,
 		{
 			method: "POST",
-			headers: buildAuthHeaders(),
+			headers: await buildAuthHeaders(accountId),
 			body: form,
 		}
 	);
@@ -464,7 +532,7 @@ async function uploadFileBatch(advId, files, folderPath) {
 		const err = new Error(
 			payload?.message ||
 				payload?.error ||
-				`Mindshare upload failed (${response.status})`
+				`Asset library upload failed (${response.status})`
 		);
 		err.statusCode =
 			response.status >= 400 && response.status < 600
@@ -504,7 +572,7 @@ async function uploadAssetsToAccount(accountId, files = [], folder = "") {
 			const batches = splitUploadBatches(group.files);
 			for (const batch of batches) {
 				batchResults.push(
-					await uploadFileBatch(advId, batch, group.folder)
+					await uploadFileBatch(accountId, advId, batch, group.folder)
 				);
 			}
 		}
@@ -634,7 +702,7 @@ async function resolveUploadedCdnUrl(
 	let url = await lookupCdnUrlByFilenames(accountId, names);
 	if (url) return url;
 
-	// Brief retry — Mindshare can lag slightly after upload.
+	// Brief retry — The asset library can lag slightly after upload.
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	return (await lookupCdnUrlByFilenames(accountId, names)) || "";
 }
@@ -645,14 +713,14 @@ async function listAssetsByPrefix(accountId, prefix) {
 	if (prefix != null && String(prefix).trim()) {
 		query.set("prefix", String(prefix).trim());
 	}
-	const url = `${getBaseUrl()}/v2/accounts/${advId}/asset-library${
+	const url = `${await getBaseUrl(accountId)}/v2/accounts/${advId}/asset-library${
 		query.toString() ? `?${query.toString()}` : ""
 	}`;
 
 	const response = await fetch(url, {
 		method: "GET",
 		headers: {
-			...buildAuthHeaders(),
+			...(await buildAuthHeaders(accountId)),
 			Accept: "application/json",
 		},
 	});
@@ -661,7 +729,7 @@ async function listAssetsByPrefix(accountId, prefix) {
 		const err = new Error(
 			payload?.message ||
 				payload?.error ||
-				`Mindshare asset lookup failed (${response.status})`
+				`Asset library lookup failed (${response.status})`
 		);
 		err.statusCode = response.status >= 400 && response.status < 600
 			? response.status
@@ -688,17 +756,21 @@ async function listAssetsByPrefix(accountId, prefix) {
 	};
 }
 
-async function fetchAssetLibraryPage(advId, { prefix = "", nextKey = null } = {}) {
+async function fetchAssetLibraryPage(
+	accountId,
+	advId,
+	{ prefix = "", nextKey = null } = {}
+) {
 	const query = new URLSearchParams();
 	if (prefix) query.set("prefix", prefix);
 	if (nextKey) query.set("nextKey", String(nextKey));
-	const url = `${getBaseUrl()}/v2/accounts/${advId}/asset-library${
+	const url = `${await getBaseUrl(accountId)}/v2/accounts/${advId}/asset-library${
 		query.toString() ? `?${query.toString()}` : ""
 	}`;
 	const response = await fetch(url, {
 		method: "GET",
 		headers: {
-			...buildAuthHeaders(),
+			...(await buildAuthHeaders(accountId)),
 			Accept: "application/json",
 		},
 	});
@@ -707,7 +779,7 @@ async function fetchAssetLibraryPage(advId, { prefix = "", nextKey = null } = {}
 		const err = new Error(
 			payload?.message ||
 				payload?.error ||
-				`Mindshare asset lookup failed (${response.status})`
+				`Asset library lookup failed (${response.status})`
 		);
 		err.statusCode =
 			response.status >= 400 && response.status < 600
@@ -778,7 +850,7 @@ async function listAccountAssets(
 		do {
 			if (pages >= maxPages) break;
 			pages += 1;
-			const payload = await fetchAssetLibraryPage(advId, {
+			const payload = await fetchAssetLibraryPage(accountId, advId, {
 				prefix,
 				nextKey,
 			});
@@ -949,7 +1021,7 @@ async function listAccountFolders(accountId) {
 
 		let nextKey = null;
 		do {
-			const payload = await fetchAssetLibraryPage(advId, {
+			const payload = await fetchAssetLibraryPage(accountId, advId, {
 				prefix,
 				nextKey,
 			});
@@ -1123,6 +1195,7 @@ module.exports = {
 	resolveAssetUrlWithFallback,
 	matchAssetUrl,
 	resolveAccountAdvId,
+	getAssetLibraryConfig,
 	pickAssetUrl,
 	pickAssetName,
 	pickFirstUploadedCdnUrl,

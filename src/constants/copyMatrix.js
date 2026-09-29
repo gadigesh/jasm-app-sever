@@ -16,12 +16,15 @@ function injectRowIdIntoRowData(rowData, rowIndex) {
 	};
 }
 
-/** Normalize cell strings for CM + AS sheets. */
+/**
+ * Normalize cell strings for CM + AS sheets. Line breaks inside a cell are
+ * kept as "\n"; flattening them is an explicit column action.
+ */
 function normalizeCellText(value) {
 	if (value == null) return "";
 	return String(value)
-		.replace(/\r\n/g, "\n")
-		.replace(/[\r\n\u000b\u000c\u0085\u2028\u2029\t]+/g, " ")
+		.replace(/\r\n?/g, "\n")
+		.replace(/[\u000b\u000c\u0085\u2028\u2029]/g, "\n")
 		.replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, " ")
 		.replace(/[\u200B\u200C\u200D\uFEFF]/g, "")
 		// Leading/trailing only — keep intentional spaces in the middle

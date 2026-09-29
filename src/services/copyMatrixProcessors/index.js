@@ -24,6 +24,9 @@ const {
 	rowDataFromArray,
 	getWorksheetMaxColumn,
 } = require("../../utils/sheetColumnHelpers");
+const {
+	assertCopyMatrixCellRules,
+} = require("../../utils/copyMatrixCellValidation");
 
 const BATCH_SIZE = 500;
 const ROW_LIMIT = 40000;
@@ -186,16 +189,18 @@ async function parseCopyMatrixSource(matrixDoc) {
 		throw new Error("This copy matrix has no source file or Google Sheet to refresh");
 	}
 
+	let result;
 	if (matrixDoc.inputType === "gsheet") {
-		return processGsheet(matrixDoc);
+		result = await processGsheet(matrixDoc);
+	} else if (matrixDoc.fileType === "csv" || matrixDoc.fileType === "txt") {
+		result = await processCsv(matrixDoc);
+	} else if (matrixDoc.fileType === "xlsx" || matrixDoc.fileType === "xls") {
+		result = await processXlsx(matrixDoc);
+	} else {
+		throw new Error("Unsupported file type");
 	}
-	if (matrixDoc.fileType === "csv" || matrixDoc.fileType === "txt") {
-		return processCsv(matrixDoc);
-	}
-	if (matrixDoc.fileType === "xlsx" || matrixDoc.fileType === "xls") {
-		return processXlsx(matrixDoc);
-	}
-	throw new Error("Unsupported file type");
+	assertCopyMatrixCellRules(result.rows);
+	return result;
 }
 
 async function processCopyMatrix(matrixId, { draft = false } = {}) {
@@ -234,6 +239,9 @@ async function processCopyMatrix(matrixId, { draft = false } = {}) {
 			freshDoc.message = err.message;
 			freshDoc.errorLog = err.stack;
 			await freshDoc.save();
+		}
+		if (err.statusCode === 400) {
+			throw err;
 		}
 	}
 }

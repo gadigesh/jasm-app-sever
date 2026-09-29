@@ -12,7 +12,7 @@ const {
 const {
 	buildUpdateImagesAssetIndex,
 	resolveAssetUrlWithFallback,
-} = require("./mindshareAssetLibrary");
+} = require("./assetLibrary");
 
 /**
  * Prepare find/replace query text.
